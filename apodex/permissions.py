@@ -29,11 +29,21 @@ _DEFAULT_PATH = os.path.expanduser("~/.config/apodex/permissions.json")
 _MULTI_VERB = frozenset({
     "git", "npm", "pnpm", "yarn", "uv", "pip", "pip3", "cargo", "go", "docker",
     "poetry", "conda", "make", "apt", "apt-get", "brew", "kubectl", "gh",
+    # exec-capable / destructive programs: a one-word rule ("always allow
+    # curl") would green-light exfiltration or deletion with any arguments.
+    "python", "python3", "node", "bash", "sh", "zsh", "curl", "wget", "rm",
+    "ssh", "scp", "rsync", "chmod", "chown", "kill", "pkill", "find", "xargs",
 })
-_SEGMENT_SPLIT = re.compile(r"&&|\|\||\||;")
-_HELPER_CMDS = frozenset({
-    "cd", "pwd", "export", "set", "env", "echo", "mkdir", "clear", "true", "source", ".",
-})
+# ``\n``/``\r`` are separators bash honours; a rule must see every segment.
+_SEGMENT_SPLIT = re.compile(r"&&|\|\||\||;|\r\n|\n|\r")
+# Segments skipped when matching. ``env``/``source``/``.``/``export`` are NOT
+# helpers: ``env`` execs its arguments, ``source`` runs a file, ``export``
+# rewrites PATH/LD_PRELOAD for the segment the rule does allow.
+_HELPER_CMDS = frozenset({"cd", "pwd", "set", "echo", "clear", "true"})
+# Constructs a saved prefix rule cannot vouch for: command substitution,
+# process substitution, redirections and a background ``&`` all smuggle a
+# second command past ``startswith(prefix)``. Any of them -> no match -> confirm.
+_UNMATCHABLE = re.compile(r"\$\(|`|<\(|>>?|(?<![&>])&(?!&)|<<<")
 
 
 def _extract_prefix_from_segment(seg: str) -> str:
@@ -62,11 +72,25 @@ def _bash_prefix(cmd: str) -> str:
 
 
 def rule_for(name: str, args: dict) -> str:
-    """The allow-rule string an 'always allow' on this call would create."""
+    """The allow-rule string an 'always allow' on this call would create.
+
+    Empty for a bash call with no usable prefix: the old fallback ``"bash"``
+    was a wildcard that allowed every future command.
+    """
     if name == "bash":
         p = _bash_prefix(str(args.get("command", "")))
-        return f"Bash({p})" if p else "bash"
+        return f"Bash({p})" if p else ""
     return name
+
+
+def _is_dangerous_call(name: str, args: dict) -> bool:
+    if name != "bash":
+        return False
+    try:
+        from apodex.agent_tools import detect_danger
+    except Exception:
+        return True  # cannot assess -> refuse to persist
+    return bool(detect_danger(str(args.get("command", ""))))
 
 
 @dataclass
@@ -101,8 +125,13 @@ class PermissionStore:
         return self._matches(self.deny, name, args)
 
     def add_allow(self, name: str, args: dict) -> str:
-        """Persist 'always allow' for this call; returns the rule added."""
+        """Persist 'always allow' for this call; returns the rule added, or
+        ``""`` when nothing was saved: a dangerous command (``rm -rf``, force
+        push, ...) must be typed-confirmed every time, and an empty prefix
+        would be a wildcard."""
         rule = rule_for(name, args)
+        if not rule or _is_dangerous_call(name, args):
+            return ""
         self.allow.add(rule)
         self.save()
         return rule
@@ -115,9 +144,13 @@ class PermissionStore:
             if "bash" in rules or "Bash" in rules or "Bash(*)" in rules:
                 return True
             prefixes = {r[5:-1] for r in rules if r.startswith("Bash(") and r.endswith(")")}
+            prefixes.discard("")
             if not prefixes:
                 return False
-            segs = [s.strip() for s in _SEGMENT_SPLIT.split(str(args.get("command", ""))) if s.strip()]
+            command = str(args.get("command", ""))
+            if _UNMATCHABLE.search(command):
+                return False
+            segs = [s.strip() for s in _SEGMENT_SPLIT.split(command) if s.strip()]
             # Filter out helper segments (e.g. 'cd /foo') unless all segments are helpers
             non_helpers = [
                 s for s in segs

@@ -520,7 +520,11 @@ class TerminalObserver(BaseObserver):
             # 'Always allow this command' → persist a rule so identical calls
             # auto-approve next time (danger/deny still override it).
             if decision.remember and self.rules is not None:
-                self.r.note(f"✓ always allowing: {self.rules.add_allow(name, eff_args)}")
+                saved = self.rules.add_allow(name, eff_args)
+                if saved:
+                    self.r.note(f"✓ always allowing: {saved}")
+                else:
+                    self.r.note("✓ approved once — not saved as a rule (dangerous or unscopable command)")
 
         # Allowed (safe or approved) → snapshot a mutating op before it runs so
         # the change is diffable + revertable, then let it execute.

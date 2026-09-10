@@ -437,7 +437,8 @@ def assess_with_rules(
     3. If ``auto_for_me`` is enabled (Docker / trusted env mode), any non-denied call
        is treated as safe.
     4. If the user saved an explicit ``allow`` rule for this command/tool, downgrade
-       ``RISK_CONFIRM`` to ``RISK_SAFE``.
+       a non-dangerous ``RISK_CONFIRM`` to ``RISK_SAFE``. A call flagged ``danger``
+       is never downgraded by a rule.
     """
     base = assess_tool_risk(name, args, cwd)
     if rules is not None and rules.denies(name, args):
@@ -446,6 +447,8 @@ def assess_with_rules(
         return base
     if auto_for_me:
         return ToolRisk(RISK_SAFE, "auto for me (docker/trusted env)", base.target)
-    if base.level == RISK_CONFIRM and rules is not None and rules.allows(name, args):
+    # A saved allow never covers a *dangerous* confirm (rm -rf, force push,
+    # dep install): those keep the typed confirmation the rule store promises.
+    if base.level == RISK_CONFIRM and not base.danger and rules is not None and rules.allows(name, args):
         return ToolRisk(RISK_SAFE, "allowed by a saved rule", base.target)
     return base

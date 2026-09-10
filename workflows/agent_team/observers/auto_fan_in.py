@@ -6,6 +6,7 @@ import logging
 
 from frontier_agent.components.agent_bus import AgentBus, SubAgentResult
 from frontier_agent.components.agent_bus.fan_in import (
+    UNTRUSTED_REPORTS_HEADER,
     format_status_line,
     process_collected,
 )
@@ -56,7 +57,9 @@ class AutoFanInObserver(BaseObserver):
             ctx.task_id, ctx.turn, len(collected),
             batch.evidence_count, batch.assertion_count, batch.incomplete_count,
         )
-        return Intervention(inject_messages=["\n\n".join([*batch.blocks, status])])
+        return Intervention(inject_messages=[
+            "\n\n".join([UNTRUSTED_REPORTS_HEADER, *batch.blocks, status]),
+        ])
 
 
 __all__ = ["AutoFanInObserver"]

@@ -217,6 +217,31 @@ def test_newline_and_process_substitution_not_autoapproved():
         assert assess_tool_risk("bash", {"command": cmd}, cwd).level in (RISK_CONFIRM, RISK_DENY), repr(cmd)
 
 
+def test_environment_dumps_not_autoapproved():
+    """Audit C1: ``printenv`` / ``/proc/*/environ`` put the harness's API keys
+    into the model context; they must at least ask."""
+    for cmd in ("printenv", "printenv OPENAI_API_KEY", "cat /proc/self/environ",
+                "tr '\\0' '\\n' < /proc/1/environ"):
+        assert not is_read_only_bash(cmd), cmd
+
+
+def test_native_shell_does_not_inherit_secrets(monkeypatch):
+    """Audit C1: under the native strategy the tool shell is a host
+    subprocess; it must not see the keys ``load_dotenv`` put in os.environ."""
+    from apodex.sandbox import NATIVE, Strategy, run_shell, scrub_secret_env
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-canary-1")
+    monkeypatch.setenv("SERPER_API_KEY", "canary-2")
+    monkeypatch.setenv("MY_SERVICE_TOKEN", "canary-3")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "canary-4")
+    monkeypatch.setenv("HARMLESS_SETTING", "keep-me")
+    env = scrub_secret_env(dict(__import__("os").environ))
+    assert "HARMLESS_SETTING" in env and "PATH" in env
+    for k in ("OPENAI_API_KEY", "SERPER_API_KEY", "MY_SERVICE_TOKEN", "AWS_SECRET_ACCESS_KEY"):
+        assert k not in env, k
+    code, out, _ = asyncio.run(run_shell("env", "/tmp", 10, Strategy(NATIVE, "test")))
+    assert code == 0 and "canary" not in out and "keep-me" in out
+
+
 def test_git_write_capable_subcommands_not_autoapproved():
     """Audit A4: ``git config core.fsmonitor`` is remote code execution on the
     next ``git status``; ``--output`` writes any file; remote/branch/tag mutate."""

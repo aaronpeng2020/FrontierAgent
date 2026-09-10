@@ -41,6 +41,7 @@ files configure the boundary with that variable.
 from __future__ import annotations
 
 import asyncio
+import re
 import logging
 import os
 import shlex
@@ -233,6 +234,30 @@ def _get_bwrap_sandbox(cwd: str) -> Any:
     return _bwrap_sandbox[1]
 
 
+# Environment variables that must never reach a model-authored process. The
+# CLI ``load_dotenv``s the whole ``.env`` into ``os.environ`` (model key,
+# search/scrape keys, judge keys), and under NATIVE/HOST/CONTAINER the shell
+# below is a plain host subprocess that would inherit all of it — one
+# ``printenv`` in a tool result then lands the keys in the model context, the
+# trace and any web_fetch the model makes afterwards.
+_SECRET_ENV = re.compile(
+    r"(^|_)(API_?KEY|APIKEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH|"
+    r"PRIVATE_KEY|ACCESS_KEY|SESSION_KEY|SIGNING_KEY)($|_)|"
+    r"^(OPENAI|ANTHROPIC|SERPER|JINA|HF|HUGGINGFACE|AWS|GOOGLE|AZURE|GH|GITHUB|NPM|PYPI)_",
+    re.IGNORECASE,
+)
+
+
+def scrub_secret_env(env: Mapping[str, str]) -> dict[str, str]:
+    """``env`` minus anything that looks like a credential.
+
+    Denylist rather than the container allowlist on purpose: the native
+    runtime is the user's own shell and must keep PATH, venvs, locale and
+    tool config working; it only has to stop leaking keys.
+    """
+    return {k: v for k, v in env.items() if not _SECRET_ENV.search(k)}
+
+
 async def run_shell(
     command: str, cwd: str, timeout: int, strategy: Strategy,
 ) -> tuple[int, str, str]:
@@ -256,6 +281,7 @@ async def run_shell(
     proc = await asyncio.create_subprocess_shell(
         command,
         cwd=cwd,
+        env=scrub_secret_env(os.environ),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

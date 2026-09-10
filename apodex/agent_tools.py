@@ -187,13 +187,15 @@ def detect_danger(cmd: str) -> str:
 _READONLY_CMDS = frozenset({
     "ls", "cat", "head", "tail", "wc", "find", "grep", "egrep", "fgrep", "rg",
     "tree", "pwd", "echo", "printf", "which", "type", "file", "stat", "du",
-    "df", "printenv", "date", "whoami", "uname", "hostname", "id",
+    "df", "date", "whoami", "uname", "hostname", "id",
     "basename", "dirname", "realpath", "readlink", "uniq", "cut",
     "column", "tr", "nl", "tac", "diff", "cmp", "sha256sum", "md5sum",
     "ps", "top", "true", "test",
 })
 # NOTE: deliberately NOT read-only: ``env`` (can exec an arbitrary command),
-# ``sort`` (``-o``/``--output`` writes a file), ``xargs`` (runs anything).
+# ``sort`` (``-o``/``--output`` writes a file), ``xargs`` (runs anything),
+# ``printenv`` (dumps the harness environment — API keys — into the model
+# context without a prompt).
 # git subcommands that don't mutate the repo / working tree.
 _GIT_READONLY = frozenset({
     "status", "diff", "log", "show", "rev-parse", "ls-files",
@@ -217,7 +219,7 @@ _GIT_WRITE_FLAGS = re.compile(r"(^|\s)(--output(=|\s)|--exec(=|\s)|-c(=|\s)|--gi
 _MUTATION_GUARD = re.compile(
     r">>?|\$\(|`|(?<![&>])&(?!&)|"                       # redirect / subst / background &
     r"[\r\n]|<\(|<<<|\$\(\(|/dev/tcp/|/dev/udp/|"       # newline separator, process subst, here-string, arith, net pseudo-files
-    r"--pre\b|"                                          # rg/grep --pre runs a preprocessor
+    r"--pre\b|/proc/[^\s/]*/environ|"                   # rg/grep --pre runs a preprocessor; environ dumps secrets
     r"\b(rm|mv|cp|dd|mkfs|tee|truncate|chmod|chown|chgrp|ln|kill|pkill|"
     r"reboot|shutdown|install|pip|npm|pnpm|yarn|uv|apt|brew|make|sudo|"
     r"xargs|eval|exec|source|env|sort)\b|"               # exec-ish / write-capable

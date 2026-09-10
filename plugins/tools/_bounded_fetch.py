@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import asyncio
 import os
 
@@ -235,6 +237,26 @@ def pin_to_address(
 
 #: Redirect hops a scrape may follow. Matches httpx's own default ceiling.
 MAX_REDIRECT_HOPS = 20
+
+
+_URL_USERINFO = re.compile(r"(://)[^/\s@]+@")
+_URL_SECRET_PARAM = re.compile(
+    r"([?&](?:api[_-]?key|apikey|key|token|access[_-]?token|auth[_-]?token|secret|"
+    r"password|passwd|sig|signature|credential)=)[^&\s'\"]+",
+    re.IGNORECASE,
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Strip ``user:pass@`` and ``?key=…`` values from any URL in *text*.
+
+    httpx error messages quote the full request URL (``str(URL)`` keeps the
+    userinfo; only ``repr`` masks it). Tool errors go straight into the
+    model context and the trace, so a gateway configured as
+    ``https://user:pass@host`` or ``?key=…`` would leak on the first 401.
+    """
+    text = _URL_USERINFO.sub(r"\1***@", text)
+    return _URL_SECRET_PARAM.sub(r"\1***", text)
 
 
 class RedirectRefused(Exception):

@@ -7,6 +7,8 @@ like bugs. Cleaning them up shifts tool observations off-distribution.
 
 from __future__ import annotations
 
+from plugins.tools._bounded_fetch import redact_secrets
+
 import asyncio
 import json
 import logging
@@ -312,7 +314,7 @@ async def web_search_aligned(
         return _format_results_plaintext(merged)
 
     except Exception as e:
-        return f"[ERROR]: Unexpected error: {e!s}"
+        return f"[ERROR]: Unexpected error: {redact_secrets(str(e))}"
 
 
 __all__ = ["web_search_aligned"]

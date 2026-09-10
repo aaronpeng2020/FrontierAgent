@@ -40,7 +40,8 @@ class TraceObserver(BaseObserver):
 
     def _write(self, rec: dict[str, Any]) -> None:
         try:
-            with open(self.path, "a", encoding="utf-8") as f:
+            from apodex.run_layout import secure_open
+            with secure_open(self.path, "a") as f:
                 f.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
                 f.flush()
         except Exception:

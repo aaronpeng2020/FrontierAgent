@@ -7,6 +7,8 @@ form.
 
 from __future__ import annotations
 
+from plugins.tools._bounded_fetch import redact_secrets
+
 import asyncio
 import json
 import logging
@@ -184,7 +186,7 @@ async def _scrape_url_with_jina(
             if attempt < len(retry_delays):
                 await asyncio.sleep(delay)
                 continue
-            return {"success": False, "content": "", "error": str(e)}
+            return {"success": False, "content": "", "error": redact_secrets(str(e))}
         except httpx.HTTPStatusError as e:
             sc = e.response.status_code
             record_api_request("jina", requests=0, errors=1)
@@ -193,10 +195,10 @@ async def _scrape_url_with_jina(
             ):
                 await asyncio.sleep(delay)
                 continue
-            return {"success": False, "content": "", "error": str(e)}
+            return {"success": False, "content": "", "error": redact_secrets(str(e))}
         except Exception as e:
             record_api_request("jina", requests=0, errors=1)
-            return {"success": False, "content": "", "error": str(e)}
+            return {"success": False, "content": "", "error": redact_secrets(str(e))}
 
     if response is None:
         return {"success": False, "content": "", "error": "No response received"}
@@ -303,12 +305,12 @@ async def _scrape_url_with_python(
         except RedirectRefused as e:
             # A refused hop is a policy decision, not a transport fault: do not
             # burn the remaining retries re-requesting the same chain.
-            return {"success": False, "content": "", "error": str(e)}
+            return {"success": False, "content": "", "error": redact_secrets(str(e))}
         except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as e:
             if attempt < len(retry_delays):
                 await asyncio.sleep(delay)
                 continue
-            return {"success": False, "content": "", "error": str(e)}
+            return {"success": False, "content": "", "error": redact_secrets(str(e))}
         except httpx.HTTPStatusError as e:
             sc = e.response.status_code
             if (sc >= 500 or sc in [408, 409, 425, 429]) and attempt < len(
@@ -316,9 +318,9 @@ async def _scrape_url_with_python(
             ):
                 await asyncio.sleep(delay)
                 continue
-            return {"success": False, "content": "", "error": str(e)}
+            return {"success": False, "content": "", "error": redact_secrets(str(e))}
         except Exception as e:
-            return {"success": False, "content": "", "error": str(e)}
+            return {"success": False, "content": "", "error": redact_secrets(str(e))}
 
     return {"success": False, "content": "", "error": "All retries exhausted"}
 
@@ -497,9 +499,9 @@ async def _extract_with_candidate(
             if attempt < len(retry_delays):
                 await asyncio.sleep(delay)
                 continue
-            return {"success": False, "extracted_info": "", "error": str(e)}
+            return {"success": False, "extracted_info": "", "error": redact_secrets(str(e))}
         except Exception as e:
-            return {"success": False, "extracted_info": "", "error": str(e)}
+            return {"success": False, "extracted_info": "", "error": redact_secrets(str(e))}
 
     if response is None:
         return {"success": False, "extracted_info": "", "error": "No response"}
@@ -517,7 +519,7 @@ async def _extract_with_candidate(
         try:
             extracted = data["choices"][0]["message"]["content"]
         except (KeyError, IndexError) as e:
-            return {"success": False, "extracted_info": "", "error": str(e)}
+            return {"success": False, "extracted_info": "", "error": redact_secrets(str(e))}
         # This raw-httpx LLM call bypasses the middleware
         # chain entirely — without this forward its tokens appear
         # nowhere (not even per-run). Lands in the top-level
@@ -540,7 +542,7 @@ async def _extract_with_candidate(
     return {
         "success": False,
         "extracted_info": "",
-        "error": f"Unexpected response: {data}",
+        "error": f"Unexpected response: {redact_secrets(str(data)[:500])}",
     }
 
 
@@ -762,7 +764,7 @@ async def web_fetch_aligned(
         return "\n".join(lines)
 
     except Exception as e:
-        return f"[ERROR]: Unexpected error: {e!s}"
+        return f"[ERROR]: Unexpected error: {redact_secrets(str(e))}"
 
 
 __all__ = ["web_fetch_aligned"]

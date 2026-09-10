@@ -81,7 +81,8 @@ class _EngineLogRouter(logging.Handler):
                 from apodex.run_layout import run_dir
 
                 path = run_dir(os.environ["APODEX_SESSION_ID"]) / "engine.log"
-                with path.open("a", encoding="utf-8") as stream:
+                from apodex.run_layout import secure_open
+                with secure_open(path, "a") as stream:
                     stream.write(self.format(record) + "\n")
         except Exception:
             pass

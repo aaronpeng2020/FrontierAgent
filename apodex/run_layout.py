@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import datetime as dt
 import os
 import re
@@ -55,6 +57,10 @@ def run_dir(
         raise ValueError(f"invalid run session id: {session_id!r}") from exc
     if create:
         target.mkdir(parents=True, exist_ok=True)
+        # Run dirs hold trace.jsonl / session.json with full tool output and
+        # message history; keep them private to the user regardless of umask.
+        with contextlib.suppress(OSError):
+            os.chmod(target, 0o700)
     return target
 
 
@@ -119,3 +125,14 @@ __all__ = [
     "activate_run", "local_time_from_timestamp", "local_timezone",
     "new_run_timestamp", "pinned_mounts", "run_dir", "runs_root",
 ]
+
+
+def secure_open(path: "str | os.PathLike[str]", mode: str = "a", *, encoding: str = "utf-8"):
+    """``open()`` for run artifacts that must be private: the file is created
+    0600 (independent of umask) and, if it already exists, tightened to 0600.
+    ``mode`` is ``"a"`` or ``"w"``."""
+    flags = os.O_WRONLY | os.O_CREAT | (os.O_APPEND if "a" in mode else os.O_TRUNC)
+    fd = os.open(os.fspath(path), flags, 0o600)
+    with contextlib.suppress(OSError):
+        os.fchmod(fd, 0o600)
+    return os.fdopen(fd, mode, encoding=encoding)

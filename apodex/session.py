@@ -604,7 +604,8 @@ class TerminalSession(TaskRunnerMixin):
 
             path = _session_state_path(self.session_id)
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w", encoding="utf-8") as f:
+            from apodex.run_layout import secure_open
+            with secure_open(path, "w") as f:
                 json.dump({
                     "session_id": self.session_id,
                     "created_at": self.created_at,

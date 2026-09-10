@@ -138,10 +138,27 @@ def test_terminal_modes_only_select_guarded_web_fetch_implementations() -> None:
     assert "aligned" in seen
 
 
-async def test_redirect_hops_are_validated_not_followed_blindly() -> None:
+async def test_redirect_hops_are_validated_not_followed_blindly(monkeypatch) -> None:
     """A vetted public URL can still answer 302 → private, so each hop is
     re-vetted instead of letting httpx follow the chain."""
+    import ipaddress
+    import socket
+
     import httpx
+
+    # Deterministic resolution: the guard must be tested against addresses we
+    # control, not the host's resolver (fake-ip proxies answer 198.18.x.x for
+    # every public name, which the guard rightly refuses).
+    real_getaddrinfo = socket.getaddrinfo
+
+    def fake_getaddrinfo(host, port, *a, **kw):
+        try:
+            ipaddress.ip_address(host)
+            return real_getaddrinfo(host, port, *a, **kw)  # literal: unchanged
+        except ValueError:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
 
     from plugins.tools._bounded_fetch import RedirectRefused, next_hop
 

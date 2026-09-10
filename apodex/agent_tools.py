@@ -196,19 +196,32 @@ _READONLY_CMDS = frozenset({
 # ``sort`` (``-o``/``--output`` writes a file), ``xargs`` (runs anything).
 # git subcommands that don't mutate the repo / working tree.
 _GIT_READONLY = frozenset({
-    "status", "diff", "log", "show", "branch", "rev-parse", "ls-files",
-    "remote", "blame", "describe", "tag", "config", "shortlog", "name-rev",
+    "status", "diff", "log", "show", "rev-parse", "ls-files",
+    "blame", "describe", "shortlog", "name-rev",
 })
+# Subcommands that are read-only ONLY in specific flag forms. Bare
+# ``git config core.fsmonitor CMD`` is remote code execution on the next
+# ``git status``; ``remote set-url``, ``branch -D``, ``tag -d`` mutate.
+_GIT_READONLY_FORMS: dict[str, frozenset[str]] = {
+    "config": frozenset({"--get", "--get-all", "--get-regexp", "--list", "-l"}),
+    "branch": frozenset({"--list", "-l", "--show-current", "-a", "-r", "-v", "-vv", "--all", "--remotes"}),
+    "remote": frozenset({"-v", "show", "get-url"}),
+    "tag": frozenset({"--list", "-l", "-n"}),
+}
+# git options (before or after the subcommand) that write or execute.
+_GIT_WRITE_FLAGS = re.compile(r"(^|\s)(--output(=|\s)|--exec(=|\s)|-c(=|\s)|--git-dir(=|\s)|--work-tree(=|\s)|-C(=|\s))")
 # Mutation/exec verbs + flags that veto auto-approve even under a read-only
 # leading program: redirects, command substitution, **background ``&``**,
 # write-capable ``find`` actions, package/exec verbs, etc. When in doubt the
 # command falls through to "confirm" (fail-safe), never silent auto-run.
 _MUTATION_GUARD = re.compile(
     r">>?|\$\(|`|(?<![&>])&(?!&)|"                       # redirect / subst / background &
+    r"[\r\n]|<\(|<<<|\$\(\(|/dev/tcp/|/dev/udp/|"       # newline separator, process subst, here-string, arith, net pseudo-files
+    r"--pre\b|"                                          # rg/grep --pre runs a preprocessor
     r"\b(rm|mv|cp|dd|mkfs|tee|truncate|chmod|chown|chgrp|ln|kill|pkill|"
     r"reboot|shutdown|install|pip|npm|pnpm|yarn|uv|apt|brew|make|sudo|"
     r"xargs|eval|exec|source|env|sort)\b|"               # exec-ish / write-capable
-    r"-exec(dir)?\b|-ok(dir)?\b|-delete\b|-f(print|printf|ls)\b",  # find write/exec actions
+    r"-exec(dir)?\b|-ok(dir)?\b|-delete\b|-f(print0?|printf|ls)\b",  # find write/exec actions
     re.IGNORECASE,
 )
 
@@ -221,6 +234,26 @@ def is_mutating_tool(name: str, args: dict) -> bool:
     if name == "bash":
         return not is_read_only_bash(str(args.get("command", "")))
     return False
+
+
+def _is_read_only_git(argv: list[str]) -> bool:
+    """``git`` is read-only only for an allowlisted subcommand, in an
+    allowlisted flag form, with no write/exec option anywhere on the line."""
+    if not argv or _GIT_WRITE_FLAGS.search(" " + " ".join(argv)):
+        return False
+    sub = argv[0]
+    if sub in _GIT_READONLY:
+        return True
+    forms = _GIT_READONLY_FORMS.get(sub)
+    if forms is None:
+        return False
+    # every remaining token must be an allowlisted flag or a plain key/name
+    rest = argv[1:]
+    if not rest:
+        return sub in ("branch", "remote", "tag")  # bare listing forms
+    if not any(t in forms for t in rest):
+        return False
+    return all(t in forms or not t.startswith("-") for t in rest)
 
 
 def is_read_only_bash(cmd: str) -> bool:
@@ -238,7 +271,7 @@ def is_read_only_bash(cmd: str) -> bool:
             return False
         prog = os.path.basename(toks[0])
         if prog == "git":
-            if len(toks) < 2 or toks[1] not in _GIT_READONLY:
+            if not _is_read_only_git(toks[1:]):
                 return False
         elif prog not in _READONLY_CMDS:
             return False

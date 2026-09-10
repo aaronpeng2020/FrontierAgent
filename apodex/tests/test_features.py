@@ -261,6 +261,16 @@ def test_local_search_tools_stay_inside_cwd(tmp_path, monkeypatch):
     assert "MARKER in tree" in _a.run(read_file.ainvoke({"path": "a.py"}))
 
 
+def test_plan_mode_blocks_delegation():
+    """Audit D3/A8: sub-agents run bash/create_file without the approval
+    observer, so plan mode must block starting them."""
+    from apodex.agent_tools import is_mutating_tool
+    assert is_mutating_tool("assign_task", {"task": "edit files"})
+    assert is_mutating_tool("create_subagent", {"name": "w"})
+    assert not is_mutating_tool("collect_reports", {})
+    assert not is_mutating_tool("bash", {"command": "ls"})
+
+
 def test_environment_dumps_not_autoapproved():
     """Audit C1: ``printenv`` / ``/proc/*/environ`` put the harness's API keys
     into the model context; they must at least ask."""

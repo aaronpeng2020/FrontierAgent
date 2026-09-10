@@ -505,6 +505,22 @@ class TaskRunnerMixin:
         workflow_input = render_session_history(
             compaction.turns, current_query,
         )
+        if self.plan_state.active:
+            # The generic loop appends PLAN_MODE_PROMPT to the system prompt;
+            # the workflow builds its own, so the model never learned it was
+            # in plan mode while the observer blocked every edit and every
+            # delegation. Tell it up front, and tell the user how to proceed,
+            # because the workflow tool tables do not offer exit_plan_mode.
+            from apodex.plan import PLAN_MODE_PROMPT
+            workflow_input = (
+                f"{PLAN_MODE_PROMPT}\n\nIn this mode `exit_plan_mode` is not "
+                "available: present the plan as your final answer and stop.\n\n"
+                f"{workflow_input}"
+            )
+            self.r.note(
+                "plan mode: edits and sub-agent delegation are blocked; the agent "
+                "will answer with a plan. Turn plan mode off to execute it."
+            )
         state: dict | None = None
         status = "ok"
         try:

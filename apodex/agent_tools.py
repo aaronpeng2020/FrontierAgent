@@ -240,10 +240,17 @@ _MUTATION_GUARD = re.compile(
 )
 
 
+# Delegation hands the task to a sub-agent whose own tool set includes bash,
+# create_file and download_file and which runs WITHOUT this observer, so in
+# plan mode letting it start is letting the edits happen out of sight.
+_DELEGATING_TOOLS = frozenset({"assign_task", "create_subagent"})
+
+
 def is_mutating_tool(name: str, args: dict) -> bool:
     """True if a tool call would change the working tree / system state — i.e.
-    the calls Plan mode must block. A write tool, or a non-read-only ``bash``."""
-    if name in _WRITE_TOOLS or name in _SANDBOX_WRITE_TOOLS:
+    the calls Plan mode must block. A write tool, a non-read-only ``bash``, or
+    delegation to a sub-agent (which can do both unobserved)."""
+    if name in _WRITE_TOOLS or name in _SANDBOX_WRITE_TOOLS or name in _DELEGATING_TOOLS:
         return True
     if name == "bash":
         return not is_read_only_bash(str(args.get("command", "")))

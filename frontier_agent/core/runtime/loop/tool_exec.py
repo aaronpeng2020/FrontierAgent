@@ -159,7 +159,11 @@ async def execute_tools(
 
     async def _run_one(call: dict, idx: int) -> ToolResult:
         name = call.get("name", "")
+        if not isinstance(name, str):
+            name = repr(name)  # never let an unhashable name raise out of the loop
         args = call.get("args", {})
+        if not isinstance(args, dict):
+            args = {}
         tool_call_id = call.get("id") or f"call_{turn}_{count_offset + idx}"
         tool = tool_map.get(name)
         start = time.monotonic()

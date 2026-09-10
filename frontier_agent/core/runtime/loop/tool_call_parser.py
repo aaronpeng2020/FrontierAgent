@@ -111,27 +111,48 @@ def _normalize_native_tool_call(tc: Any) -> dict | None:
         return None
     fn = tc.get("function")
     if isinstance(fn, dict):
-        raw_args = fn.get("arguments", "")
-        if isinstance(raw_args, str):
-            try:
-                args = json.loads(raw_args) if raw_args.strip() else {}
-            except (ValueError, TypeError):
-                args = {}
-        elif isinstance(raw_args, dict):
-            args = raw_args
-        else:
-            args = {}
+        name = fn.get("name", "")
+        if not isinstance(name, str):
+            # A dict/list where the name should be is model garbage; it must
+            # not reach ``name in tool_names`` (unhashable -> TypeError kills
+            # the whole run).
+            return None
         return {
-            "name": fn.get("name", "") or "",
-            "args": args if isinstance(args, dict) else {},
-            "id": tc.get("id", "") or "",
+            "name": name,
+            "args": coerce_args(fn.get("arguments", "")),
+            "id": _str_or_empty(tc.get("id")),
         }
     # Already-parsed shape (legacy langchain AIMessage.tool_calls).
+    name = tc.get("name", "")
+    if not isinstance(name, str):
+        return None
     return {
-        "name": tc.get("name", "") or "",
-        "args": tc.get("args", {}) or {},
-        "id": tc.get("id", "") or "",
+        "name": name,
+        "args": coerce_args(tc.get("args", {})),
+        "id": _str_or_empty(tc.get("id")),
     }
+
+
+def _str_or_empty(v: Any) -> str:
+    return v if isinstance(v, str) else ""
+
+
+def coerce_args(raw: Any) -> dict:
+    """Tool arguments as a dict, whatever shape the model produced.
+
+    Accepts a dict, a JSON object encoded as a string (models regularly
+    double-encode ``args``; silently replacing it with ``{}`` used to cost a
+    round trip on a "missing argument" error), or anything else -> ``{}``.
+    """
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
 
 
 class DefaultToolCallParser:
@@ -228,14 +249,13 @@ class DefaultToolCallParser:
                 logger.debug("Skipping non-object tool_call payload: %r", payload)
                 continue
 
-            name = str(payload.get("tool", "") or "").strip()
+            raw_name = payload.get("tool", "")
+            name = raw_name.strip() if isinstance(raw_name, str) else ""
             if not name or name not in tool_names:
-                logger.debug("Skipping unknown/missing tool name: %r", name)
+                logger.debug("Skipping unknown/missing tool name: %r", raw_name)
                 continue
 
-            args = payload.get("args", {})
-            if not isinstance(args, dict):
-                args = {}
+            args = coerce_args(payload.get("args", {}))
 
             results.append({"name": name, "args": args})
 
@@ -599,15 +619,13 @@ def _parse_fc_wrapped(text: str, tool_names: set[str]) -> list[dict]:
             if not isinstance(call, dict):
                 continue
             name = call.get("name", "")
-            if name not in tool_names:
+            if not isinstance(name, str) or name not in tool_names:
                 logger.warning(
                     "FunctionCall wrapper: skipping unknown tool %r "
                     "(allowed=%s)", name, sorted(tool_names),
                 )
                 continue
-            args = call.get("parameters") or call.get("arguments") or {}
-            if not isinstance(args, dict):
-                continue
+            args = coerce_args(call.get("parameters") or call.get("arguments") or {})
             results.append({"name": name, "args": args, "id": f"fc_tc_{idx}"})
             idx += 1
     logger.debug("FunctionCall wrapper: found %d tool calls", len(results))

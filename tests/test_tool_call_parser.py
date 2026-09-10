@@ -8,7 +8,7 @@ from frontier_agent.core.runtime.loop.model_profile import (
     ModelProfile,
     NativeMessageNormalizer,
 )
-from frontier_agent.core.runtime.loop.tool_call_parser import DefaultToolCallParser
+from frontier_agent.core.runtime.loop.tool_call_parser import DefaultToolCallParser, MultiFormatToolCallParser
 
 
 def _native_call(name: str, call_id: str) -> dict:
@@ -90,3 +90,38 @@ def test_executed_calls_are_left_for_the_executor_to_answer() -> None:
     _answer_dropped_tool_calls(messages, history, parsed, tool_names)
 
     assert messages == [history]
+
+
+def test_non_string_tool_names_are_skipped_not_fatal() -> None:
+    """Audit D2: a dict/list where the name should be raised
+    ``TypeError: unhashable type`` out of the parser and ended the run."""
+    parser = DefaultToolCallParser()
+    response = LLMResponse(tool_calls=[
+        {"id": "x", "type": "function", "function": {"name": {"x": 1}, "arguments": "{}"}},
+        {"id": "y", "name": ["glob_search"], "args": {}},
+        _native_call("glob_search", "ok"),
+    ])
+    calls = parser.parse(response, {"glob_search"})
+    assert [c["name"] for c in calls] == ["glob_search"]
+
+    wrapped = LLMResponse(content=(
+        '<|FunctionCallBegin|>[{"name": {"x": 1}, "parameters": {}},'
+        ' {"name": "glob_search", "parameters": {"pattern": "*"}}]<|FunctionCallEnd|>'
+    ))
+    calls = MultiFormatToolCallParser().parse(wrapped, {"glob_search"})
+    assert [c["name"] for c in calls] == ["glob_search"]
+
+
+def test_string_encoded_args_are_decoded() -> None:
+    """Audit D9: ``args`` double-encoded as a JSON string used to become ``{}``."""
+    parser = DefaultToolCallParser()
+    response = LLMResponse(tool_calls=[
+        {"id": "a", "name": "bash", "args": '{"command": "ls"}'},
+    ])
+    calls = parser.parse(response, {"bash"})
+    assert calls and calls[0]["args"] == {"command": "ls"}
+    wrapped = LLMResponse(content=(
+        '<|FunctionCallBegin|>[{"name": "bash", "parameters": "{\\"command\\": \\"pwd\\"}"}]<|FunctionCallEnd|>'
+    ))
+    calls = MultiFormatToolCallParser().parse(wrapped, {"bash"})
+    assert calls and calls[0]["args"] == {"command": "pwd"}

@@ -171,6 +171,18 @@ _DANGER_PATTERNS: list[tuple[re.Pattern[str], str]] = [
         r"\b(pip3?|uv|npm|pnpm|yarn|poetry|conda|gem|cargo|go|apt|apt-get|brew)\b"
         r"[^|;&]*\b(install|add|sync)\b", re.I,
     ), "installs dependencies"),
+    # audit A9: evasions of the patterns above
+    (re.compile(r"\brm\s+(-\S*\s+)*\$"), "recursive delete via variable"),
+    (re.compile(r"\bgit\s+push\b.*(\s\+\S|\s--delete\b|\s-\w*f)"), "git force push / delete"),
+    (re.compile(r"\b(curl|wget)\b.*\|\s*(sudo\s+)?(\S*/)?(sh|bash|zsh|dash|ksh|perl|ruby|node|python\d?|env)\b"), "pipes a download into an interpreter"),
+    (re.compile(r"\b(ba|z|da|k)?sh\s+<\("), "runs a script from process substitution"),
+    (re.compile(r"\bgit\s+(clean\b.*(\s-\S*f|\s--force)|checkout\s+--\s|restore\s+\.|stash\s+drop)"), "discards git changes"),
+    (re.compile(r"\b(npx|pnpm\s+dlx|npm\s+(i|ci|install)|pip3?\s+install|uv\s+pip\s+install)\b"), "installs / runs packages"),
+    (re.compile(r"\bchmod\b.*\s([ugoa]*\+[rwx]*s|[0-7]?[4267][0-7]{3})\b"), "setuid / world-writable chmod"),
+    (re.compile(r"\b(doas|pkexec|su)\b"), "privilege escalation"),
+    (re.compile(r"\bshred\b"), "shred"),
+    (re.compile(r"(shutil\.rmtree|os\.(remove|unlink|rmdir)|send2trash)\b"), "deletes via python"),
+    (re.compile(r":\(\)\s*\{"), "fork bomb"),
 ]
 
 

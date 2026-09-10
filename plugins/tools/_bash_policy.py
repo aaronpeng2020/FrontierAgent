@@ -106,6 +106,15 @@ _DENY_PATTERNS: tuple[tuple[str, str], ...] = (
     (r":\(\)\s*\{\s*:\|:\s*&\s*\};:", "Refuses fork bombs."),
     (r"\bDROP\s+TABLE\b", "Refuses destructive database schema deletion."),
     (r">\s*/dev/sd[a-z]", "Refuses raw writes to block devices."),
+    # Network-fed shells: the script is never seen by anyone before it runs.
+    (r"\b(curl|wget)\b[^|\n]*\|\s*(sudo\s+)?(ba|z|da|k|fi)?sh\b",
+     "Refuses piping a downloaded script into a shell; download it, read it, then run it."),
+    (r"\b(ba|z|da|k)?sh\s+<\(\s*(curl|wget)\b",
+     "Refuses running a downloaded script via process substitution."),
+    (r"\b(ba|z|da|k)?sh\s+-c\s+[\"']?\$\(\s*(curl|wget)\b",
+     "Refuses running a downloaded script via command substitution."),
+    (r"\b(nc|ncat|netcat)\b[^|\n]*\s-[a-z]*e\s", "Refuses reverse shells."),
+    (r"\bcrontab\b", "Refuses persistence via cron."),
 )
 
 _CONFIRM_PATTERNS: tuple[tuple[str, str], ...] = (
@@ -154,8 +163,13 @@ def _norm_target(arg: str) -> str:
 _VAR_RE = re.compile(r"\$\{[^}]*\}|\$[\w@*#?!-]+")
 
 
+# ``/home/<user>`` itself and its dotfiles/dotdirs are protected; a project
+# checkout below it (``/home/u/code/app/build``) stays deletable.
+_HOME_RE = re.compile(r"^/home/[^/]+/?$|^/home/[^/]+/\.")
+
+
 def _under_protected_root(path: str) -> bool:
-    return path in _PROTECTED_TARGETS or any(
+    return path in _PROTECTED_TARGETS or bool(_HOME_RE.match(path)) or any(
         path == root or path.startswith(root + "/") for root in _SYSTEM_ROOTS
     )
 
@@ -379,6 +393,13 @@ def _argv_hard_deny(commands: list[list[str]]) -> str | None:
         exe = _basename(argv[0])
         args = argv[1:]
 
+        # Privilege escalation is refused in every mode, not only under the
+        # warn/enforce allowlist: ``sudo`` turns any later check into theatre.
+        # ``strip_command_prefixes`` above drops ``sudo`` as a prefix, so look
+        # at the raw argv through the wrapper-aware resolver instead.
+        if _resolve_exe(raw_argv)[0] == "__DENY__":
+            return "Refuses privilege escalation."
+
         # ``… | xargs rm -rf`` — targets arrive on stdin, invisible to argv, so
         # the target checks below can't see them. Refuse xargs feeding a deleter
         # (or a recursive chmod/chown) outright.
@@ -397,7 +418,10 @@ def _argv_hard_deny(commands: list[list[str]]) -> str | None:
 
         # ``cd /`` (or into any protected root) arms the next relative rm/find.
         if exe == "cd":
-            cd_into_protected = bool(args) and _is_delete_protected(args[0])
+            cd_into_protected = bool(args) and (
+                _is_delete_protected(args[0])
+                or _norm_target(args[0]) == ".." or _norm_target(args[0]).startswith("../")
+            )
             continue
 
         if exe == "rm":
@@ -408,6 +432,15 @@ def _argv_hard_deny(commands: list[list[str]]) -> str | None:
                 targets = [a for a in args if not a.startswith("-")]
                 if any(_is_delete_protected(t) for t in targets):
                     return "Refuses recursive deletion of a protected path."
+                # Parent directories, bare variables and substitutions: the
+                # real target is unknowable here, so the check cannot vouch
+                # for it. Refuse rather than guess.
+                for t in targets:
+                    n = _norm_target(t)
+                    if n == ".." or n.startswith("../"):
+                        return "Refuses recursive deletion above the working directory."
+                    if _VAR_RE.fullmatch(t.strip().strip("'\"")) or "$(" in t or "`" in t:
+                        return "Refuses recursive deletion of a target that can't be validated (variable or substitution)."
                 # ``cd / && rm -rf .`` / ``rm -rf *`` / ``rm -rf ..`` after a cd
                 # into a root (_norm_target maps ``./``->``.`` and ``../``->``..``).
                 if cd_into_protected and any(
@@ -538,7 +571,11 @@ _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")
 _REDIRECT_PROTECTED_RE = re.compile(
     r"(?:&>>?|>\||>&|>>?)\s*"
-    r"(/(?:etc|usr|bin|sbin|lib|lib64|boot|dev|proc|sys|var|root|opt)\b\S*)"
+    r"(/(?:etc|usr|bin|sbin|lib|lib64|boot|dev|proc|sys|var|root|opt)\b\S*"
+    # login/ssh/git dotfiles under any home: appending to ``~/.bashrc`` or
+    # ``~/.ssh/authorized_keys`` is persistence on the host, not a file edit.
+    r"|(?:~|\$HOME|\$\{HOME\}|/home/[^/\s]+|/root)/\.(?:ssh|bashrc|bash_profile|"
+    r"profile|zshrc|zprofile|zshenv|gitconfig|config|local|cache)\b\S*)"
 )
 # Character devices that every shell idiom redirects to. Discarding a stream
 # (``2>/dev/null``) or pointing one at the terminal/an existing fd is not a

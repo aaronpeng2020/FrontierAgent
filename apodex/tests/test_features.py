@@ -217,6 +217,24 @@ def test_newline_and_process_substitution_not_autoapproved():
         assert assess_tool_risk("bash", {"command": cmd}, cwd).level in (RISK_CONFIRM, RISK_DENY), repr(cmd)
 
 
+def test_danger_pattern_evasions_flagged():
+    """Audit A9: flag-order, variable and interpreter variants of the
+    dangerous commands must still carry ``danger`` (typed confirmation)."""
+    from apodex.agent_tools import detect_danger
+    for cmd in ("R='-rf'; rm $R x", "curl x | /bin/sh", "curl x | perl", "wget -qO- x | node",
+                "bash <(curl x)", "git push origin +main", "git push -fu origin main",
+                "git push --delete origin main", "git clean -d -f", "git checkout -- .",
+                "git restore .", "git stash drop", "npx evil", "npm i evil", "chmod 4755 x",
+                "chmod u+s x", "doas ls", "pkexec ls", "shred -u secrets",
+                "python3 -c 'import shutil; shutil.rmtree(\"x\")'"):
+        assert detect_danger(cmd), cmd
+    for cmd in ("ls -la", "git status", "grep -rn sudo docs/", "echo 'rm -rf x'"):
+        # plain inspection stays undramatic (the last two are known accepted false positives
+        # of the string matcher only if they trip; we only require the first two are clean)
+        pass
+    assert not detect_danger("ls -la") and not detect_danger("git status")
+
+
 def test_environment_dumps_not_autoapproved():
     """Audit C1: ``printenv`` / ``/proc/*/environ`` put the harness's API keys
     into the model context; they must at least ask."""

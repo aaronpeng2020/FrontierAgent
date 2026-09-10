@@ -369,6 +369,10 @@ class TaskRunnerMixin:
                 )
                 self.usage.compactions += 1
                 await self.run_task("")  # resume on the compacted history
+                # Steers typed during the finishing turn would otherwise be
+                # dropped on this early return; the other exits run them.
+                if leftover:
+                    await self.run_task("\n".join(leftover))
                 return
             if result.stopped_by == "user_rejected":
                 # User declined an action → stop cleanly and hand control back

@@ -235,6 +235,32 @@ def test_danger_pattern_evasions_flagged():
     assert not detect_danger("ls -la") and not detect_danger("git status")
 
 
+def test_local_search_tools_stay_inside_cwd(tmp_path, monkeypatch):
+    """Audit B2/B7: grep/glob ran in the harness process with no cwd check
+    (``~/.ssh`` was searchable); read_file skipped the credential-name rule."""
+    from apodex.local_tools import glob_search, grep_search, read_file
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "id_rsa").write_text("PRIVATE MARKER")
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "a.py").write_text("MARKER in tree")
+    (work / ".env").write_text("API_KEY=leak")
+    (work / "server.key").write_text("leak")
+    __import__("os").symlink(outside / "id_rsa", work / "link_out")
+    monkeypatch.chdir(work)
+    _a = asyncio
+    assert "outside the working directory" in _a.run(grep_search.ainvoke({"pattern": "MARKER", "path": str(outside)}))
+    assert "outside the working directory" in _a.run(glob_search.ainvoke({"pattern": "*", "path": "../outside"}))
+    assert "outside the working directory" in _a.run(grep_search.ainvoke({"pattern": "MARKER", "path": "/"}))
+    hits = _a.run(grep_search.ainvoke({"pattern": "MARKER"}))
+    assert "a.py" in hits and "PRIVATE" not in hits          # symlink out of tree skipped
+    assert "link_out" not in _a.run(glob_search.ainvoke({"pattern": "*"}))
+    assert "credential file" in _a.run(read_file.ainvoke({"path": ".env"}))
+    assert "credential file" in _a.run(read_file.ainvoke({"path": "server.key"}))
+    assert "MARKER in tree" in _a.run(read_file.ainvoke({"path": "a.py"}))
+
+
 def test_environment_dumps_not_autoapproved():
     """Audit C1: ``printenv`` / ``/proc/*/environ`` put the harness's API keys
     into the model context; they must at least ask."""

@@ -180,6 +180,10 @@ async def read_file(path: str, start_line: int = 0, end_line: int = 0) -> str:
 
     if not (is_in_cwd or is_in_staging):
         return f"Error: '{raw}' is outside the working directory; reads are limited to {cwd}."
+    blocked = _sensitive_name(os.path.basename(target))
+    if blocked:
+        return (f"Error: '{raw}' looks like a credential file ({blocked}); reading it is refused. "
+                "Ask the user for the specific value you need instead.")
 
     ext = os.path.splitext(target)[1].lower()
     if ext in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}:
@@ -288,14 +292,49 @@ async def bash(command: str, description: str = "") -> str:
     return prune_note + (result if result.strip() else "(no output)")
 
 
+def _sensitive_name(name: str) -> str:
+    """Same rule the sandboxed tools apply (``plugins.tools._path_auth``):
+    ``.env*``, ``*.key``/``*.pem``, ``credentials``/``secret``/``token`` names.
+    Fail-safe: if the rule cannot be imported, only ``.env`` is refused."""
+    try:
+        from plugins.tools._path_auth import _blocked_name
+        return _blocked_name(name)
+    except Exception:
+        lower = name.lower()
+        return ".env" if lower == ".env" or lower.startswith(".env.") else ""
+
+
+def _scoped_dir(path: str) -> tuple[str, str]:
+    """``(realpath, "")`` for a directory inside the working directory (or the
+    input staging dir), else ``("", error)``. These tools run in the harness
+    process, outside any sandbox, so this check is the only thing between the
+    model and ``~/.ssh``."""
+    cwd = os.path.realpath(os.getcwd())
+    raw = os.path.expanduser((path or ".").strip()) or "."
+    base = os.path.realpath(raw if os.path.isabs(raw) else os.path.join(cwd, raw))
+    staging = os.path.realpath(os.environ.get("APODEX_INPUT_STAGING_DIR") or os.path.expanduser("~/.apodex-inputs"))
+    for root in (cwd, staging):
+        if base == root or base.startswith(root + os.sep):
+            return base, ""
+    return "", f"Error: '{path}' is outside the working directory; searches are limited to {cwd}."
+
+
 def _walk_pruned(base: str) -> Iterator[tuple[str, list[str]]]:
     """os.walk under ``base``, pruning (in place) the universal artifact dirs
     plus whatever the repo's .gitignore declares — repo-driven, not hardcoded.
+    Files whose real path escapes ``base`` (symlinks out of the tree) are
+    dropped, and directories are never followed through symlinks.
     """
     prune = _prune_dir_names(base)
-    for root, dirs, files in os.walk(base):
+    real_base = os.path.realpath(base)
+    for root, dirs, files in os.walk(base, followlinks=False):
         dirs[:] = [d for d in dirs if d not in prune]
-        yield root, files
+        kept = []
+        for f in files:
+            rp = os.path.realpath(os.path.join(root, f))
+            if rp == real_base or rp.startswith(real_base + os.sep):
+                kept.append(f)
+        yield root, kept
 
 
 @tool
@@ -314,7 +353,9 @@ async def glob_search(pattern: str, path: str = ".", max_results: int = 200) -> 
     """
     import fnmatch
 
-    base = os.path.realpath(path if os.path.isabs(path) else os.path.join(os.getcwd(), path))
+    base, err = _scoped_dir(path)
+    if err:
+        return err
     pat = pattern.strip()
     # '**/*.py' → '*.py' (basename pattern). Use prefix removal, NOT lstrip,
     # which would strip every leading '*'/'/' and turn '**/*.py' into '.py'
@@ -359,7 +400,9 @@ async def grep_search(
     import fnmatch
     import re as _re
 
-    base = os.path.realpath(path if os.path.isabs(path) else os.path.join(os.getcwd(), path))
+    base, err = _scoped_dir(path)
+    if err:
+        return err
     try:
         rx = _re.compile(pattern)
     except _re.error as exc:

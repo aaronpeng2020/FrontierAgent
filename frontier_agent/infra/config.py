@@ -203,8 +203,13 @@ class FrontierAgentConfig(BaseSettings):
 
     serper_api_key: str = ""
     serper_base_url: str = "https://google.serper.dev"
+    # ``web_fetch_aligned`` (react profile) still reads pages via Jina.
     jina_api_key: str = ""
     jina_base_url: str = "https://r.jina.ai"
+    # ``web_fetch`` reads pages through twice (https://twice.sh): a real
+    # browser, challenge pages and PDFs included. TWICE_API_KEY / TWICE_BASE_URL.
+    twice_api_key: str = ""
+    twice_base_url: str = "https://twice.sh"
     # Suffix-matched domains blocked from both search and fetch.
     web_domain_blacklist_extra: str = ""
     # Domain-scoped, case-insensitive phrase filtering for search snippets.

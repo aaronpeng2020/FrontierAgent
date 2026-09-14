@@ -1,9 +1,20 @@
-"""Web scraping tool with academic URL routing."""
+"""Web scraping tool with academic URL routing.
+
+Generic pages are read through twice (https://twice.sh): the service loads the
+URL in a real browser, passes anti-bot challenges where it legitimately can,
+converts PDFs, and hands back markdown. PMC / PubMed / bioRxiv / paywall URLs
+still go to the corresponding OA API first; twice is the leaf those routes
+fall back to.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -22,34 +33,24 @@ from plugins.tools._academic_fetch import (
     route_url,
 )
 from plugins.tools._bounded_fetch import (
-    MAX_REDIRECT_HOPS,
-    RedirectRefused,
-    binary_content_type,
     blocked_download_url,
-    next_hop,
     non_public_url_error,
-    pin_to_address,
     read_bounded,
-    strip_cross_origin_credentials,
-    vet_public_url,
 )
-from plugins.tools._render_check import unrendered_kind
-from plugins.tools._scrape_cache import (
-    ScrapeUnavailable,
-    format_skip_message,
-    scrape_result_cache,
-)
-from plugins.tools._scrape_cache import cache as _scrape_cache
+from plugins.tools._scrape_cache import ScrapeUnavailable, scrape_result_cache
 
 logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
 _SHORT_CONTENT_THRESHOLD = 500       # re-try via Unpaywall when content is this short
 _PAYWALL_SHORT_THRESHOLD = 500       # tighter check used for known paywall domains
+# A CAPTCHA / login-wall page is short; above this the keyword heuristic in
+# ``is_garbage_content`` only triggers the Unpaywall detour, never a failure.
+_GARBAGE_MAX_CHARS = 2_000
 
 # Below this many chars the raw page is returned verbatim instead of being
-# routed through the summary LLM, even when ``info_to_extract`` is set. The
-# summary LLM exists purely to keep 50KB+ pages from blowing the agent's
+# routed through an extraction LLM, even when ``info_to_extract`` is set. The
+# extraction step exists purely to keep 50KB+ pages from blowing the agent's
 # context; a short page (a policy paragraph, a financial snippet, a small
 # table) costs nothing to carry whole, and paraphrasing it through a
 # temperature=1.0 extractor risks drift.
@@ -63,6 +64,45 @@ _PAYWALL_SHORT_THRESHOLD = 500       # tighter check used for known paywall doma
 # compressed. Tune upward if headroom allows.
 _SUMMARY_MIN_CHARS = 12_000
 
+# ── twice tunables ────────────────────────────────────────────────────────
+_TWICE_FETCH_PATH = "/v1/fetch"
+# Server-side wait before ``POST /v1/fetch`` answers 202 with a run id
+# instead of the page (service default 90, max 120).
+_TWICE_WAIT_S = 90
+# First slice of page text requested. Overflow trimming / spill handles
+# anything the agent cannot carry; the service caps a slice at 500k.
+_TWICE_MAX_CHARS = 200_000
+# Long-poll length per ``GET /v1/runs/<id>/wait`` call.
+_TWICE_POLL_S = 60
+# Hard ceiling on one fetch, polling included: a challenge page or PDF takes
+# 10-40 s, a cold runner adds 1-2 min.
+_TWICE_DEADLINE_S = 360
+# ``question`` is answered by a small model; keep the prompt bounded.
+_TWICE_MAX_QUESTION_CHARS = 2_000
+_TWICE_RUNNING_STATES = frozenset({"queued", "pending", "claimed", "running"})
+
+# URLs twice reported as ``challenge: blocked`` during the current
+# ``_fetch_one`` call. The academic routes try several URLs and only return
+# text, so the leaf notes the block here for the caller-facing message.
+_blocked_urls: ContextVar[list[str] | None] = ContextVar(
+    "web_fetch_blocked_urls", default=None,
+)
+
+
+@dataclass(frozen=True)
+class _TwicePage:
+    """One page as twice returned it."""
+
+    content: str
+    title: str = ""
+    answer: str = ""
+    status: int = 0
+    challenge: str = "none"
+
+    @property
+    def blocked(self) -> bool:
+        return self.challenge == "blocked"
+
 
 @tool
 async def web_fetch(
@@ -73,16 +113,17 @@ async def web_fetch(
 
     Automatic backend selection based on URL domain: PMC / PubMed / bioRxiv /
     medRxiv URLs go to the corresponding OA API; known paywall domains are
-    routed via Unpaywall; everything else goes through Jina Reader. Retry,
-    negative cache, and arXiv PDF→HTML redirect are applied automatically.
+    routed via Unpaywall; everything else is rendered by twice (a real
+    browser, so JavaScript apps, challenge pages and PDFs all read). Retry
+    and arXiv PDF→HTML redirect are applied automatically.
 
-    A non-empty ``info_to_extract`` routes the raw content through a cheap
-    summary LLM that extracts only the information requested. With it
+    A non-empty ``info_to_extract`` routes a long page through a cheap
+    extraction LLM that returns only the information requested. With it
     omitted the raw extracted text is returned (subject to overflow trim).
 
     Args:
         url: A URL string, or a list of URLs for parallel fetch.
-        info_to_extract: Optional focus for the summary LLM. A single
+        info_to_extract: Optional focus for the extraction LLM. A single
             string applies to every URL; a list pairs with ``url`` 1:1.
 
     Returns:
@@ -141,8 +182,8 @@ async def _fetch_one(url: str, info_to_extract: str) -> str:
     if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
-    # Vet the target before ANYTHING leaves the process — including the scrape
-    # provider's request, which would otherwise be handed an internal URL.
+    # Vet the target before ANYTHING leaves the process — including the
+    # request to twice, which would otherwise be handed an internal URL.
     non_public = await non_public_url_error(url)
     if non_public:
         return (
@@ -178,68 +219,52 @@ async def _fetch_one(url: str, info_to_extract: str) -> str:
         logger.info("Redirecting arxiv PDF → HTML: %s", html_url)
         url = html_url
 
-    # Negative-cache check: skip URLs that recently returned 403/422/429.
-    cached = _scrape_cache.check(url)
-    if cached is not None:
-        msg = format_skip_message(url, cached)
-        logger.info("web_fetch skipped (cached %d): %s", cached.status, url[:60])
-        return msg
-
     config = get_config()
     route = route_url(url)
+    question = (info_to_extract or "").strip()
 
-    # A fresh scrape is classified in the scrape function, the cache predicate,
-    # and the caller-facing warning path. Keep the verdicts for this one fetch
-    # so HTML parsing happens once per distinct response body.
-    render_verdicts: list[tuple[str, str | None]] = []
-
-    def _render_kind(content: str) -> str | None:
-        for seen, verdict in render_verdicts:
-            if content is seen or content == seen:
-                return verdict
-        verdict = unrendered_kind(content)
-        render_verdicts.append((content, verdict))
-        return verdict
+    # The leader's twice call may already carry the extraction answer. It is
+    # held outside the cache on purpose: sharing raw page text between sibling
+    # agents is fine, sharing one agent's focus is not (see ``_scrape_cache``).
+    answer: dict[str, str] = {}
+    blocked: list[str] = []
+    token = _blocked_urls.set(blocked)
 
     # Single-flight cross-run cache: sibling agents fetching the same URL share
     # one round-trip. Only validated, non-garbage content is cached; the empty
     # / garbage branches raise so the failure is neither stored nor shared.
     async def _scrape() -> str:
-        content = await _fetch_via_route(url, route, config)
-        # Post-fetch quality check: Jina can return a CAPTCHA/login page as a
-        # 200, and some un-listed paywalls slip past the route table. Try one
-        # Unpaywall-driven retry (cheap — fails fast when no DOI resolves).
-        content = await _maybe_recover_via_unpaywall(url, route, content, config)
-        if not content:
-            raise ScrapeUnavailable("empty")
-        # Final garbage check — Jina can return a CAPTCHA/login page as success.
-        if is_garbage_content(content):
+        content, page_answer = await _fetch_via_route(
+            url, route, config, question=question,
+        )
+        # Post-fetch quality check: an un-listed paywall can slip past the
+        # route table. Try one Unpaywall-driven retry (cheap — fails fast when
+        # no DOI resolves).
+        recovered = await _maybe_recover_via_unpaywall(url, route, content, config)
+        if not recovered:
+            raise ScrapeUnavailable("blocked" if blocked else "empty")
+        # Final garbage check — a login wall / "access denied" page can still
+        # come back as a 200 with no challenge flag. twice reports real
+        # challenges explicitly, so the keyword heuristic only decides for a
+        # short body: a full article that merely *mentions* Cloudflare or
+        # CAPTCHAs must not be thrown away.
+        if len(recovered) < _GARBAGE_MAX_CHARS and is_garbage_content(recovered):
             raise ScrapeUnavailable("garbage")
-        # A pre-hydration DOM survived even the browser-engine escalation
-        # above. Only the high-confidence ``shell`` verdict fails here: a
-        # merely short body ("empty") is legitimate content often enough that
-        # erroring on it would lose real pages.
-        if _render_kind(content) == "shell":
-            raise ScrapeUnavailable("unrendered")
-        return content
+        if page_answer and recovered is content:
+            answer["text"] = page_answer
+        return recovered
 
     try:
-        content = await scrape_result_cache.get_or_scrape(
-            url,
-            _scrape,
-            # A low-confidence short page is still useful enough to return,
-            # but it may be a pre-hydration race. Never let it become the
-            # process-wide answer for every later fetch of this URL.
-            should_cache=lambda scraped: _render_kind(scraped) is None,
-        )
+        content = await scrape_result_cache.get_or_scrape(url, _scrape)
     except ScrapeUnavailable as exc:
-        if str(exc) == "unrendered":
+        if str(exc) == "blocked" or blocked:
             return (
-                f"[NOT RENDERED] The page at {url} is a JavaScript app that "
-                f"served no content even with browser rendering. Fetching it "
-                f"again the same way will not help: look for the same material "
-                f"at another source (the site's own API/JSON endpoint, a PDF, "
-                f"or an archive copy), or search for the page title instead."
+                f"Could not extract content from {url}: the site blocks "
+                "automated access (anti-bot challenge, HTTP 403) even for a "
+                "real browser. Fetching it again — with this tool or with "
+                "curl — will not help: look for the same material at another "
+                "source (an archive copy, the publisher's API, a mirror), or "
+                "search for the page title instead."
             )
         if str(exc) == "garbage":
             return (
@@ -247,57 +272,54 @@ async def _fetch_one(url: str, info_to_extract: str) -> str:
                 f"anti-bot protection. Please try searching for an open-access "
                 f"version (arxiv.org, PMC, institutional repositories)."
             )
+        if not config.twice_api_key:
+            return (
+                f"Could not extract content from {url}: TWICE_API_KEY is not "
+                "set, so web_fetch cannot read web pages. Configure it "
+                "(https://twice.sh) or answer from other sources."
+            )
         return f"Could not extract content from {url}"
+    finally:
+        _blocked_urls.reset(token)
 
-    _scrape_cache.record_success(url)
-
-    # LLM extraction if requested — uses dedicated SUMMARY_LLM_* config and
-    # gracefully returns truncated raw content when unconfigured. Skipped for
-    # short pages (< _SUMMARY_MIN_CHARS): they carry whole at no context cost,
-    # and returning them verbatim avoids paraphrase drift on the exact numbers
-    # / scope qualifiers the agent asked for. The focus is still served — the
+    # LLM extraction if requested. Skipped for short pages
+    # (< _SUMMARY_MIN_CHARS): they carry whole at no context cost, and
+    # returning them verbatim avoids paraphrase drift on the exact numbers /
+    # scope qualifiers the agent asked for. The focus is still served — the
     # agent reads ``info_to_extract`` straight from the raw page.
-    if (
-        info_to_extract
-        and info_to_extract.strip()
-        and len(content) >= _SUMMARY_MIN_CHARS
-    ):
-        output = await _summary_llm_summarize(content, info_to_extract)
-    else:
-        from plugins.tools._overflow import maybe_overflow
-        output = maybe_overflow("web_fetch", content)
+    #
+    # For a long page twice already answered ``question`` while it had the
+    # page open; the dedicated SUMMARY_LLM_* endpoint only runs when there is
+    # no such answer (academic API text, a cache hit, twice left it empty).
+    if question and len(content) >= _SUMMARY_MIN_CHARS:
+        if answer.get("text"):
+            return answer["text"]
+        return await _summary_llm_summarize(content, info_to_extract)
 
-    if _render_kind(content) == "empty":
-        return (
-            f"[POSSIBLY NOT RENDERED] The page at {url} remained suspiciously "
-            "short after the browser-render retry. This result was deliberately "
-            "not cached. Use it if it answers the question; otherwise switch to "
-            "another source instead of repeatedly fetching this URL.\n\n"
-            f"{output}"
-        )
-    return output
+    from plugins.tools._overflow import maybe_overflow
+    return maybe_overflow("web_fetch", content)
 
 
 # ── Routing ───────────────────────────────────────────────────────────────
 
-async def _fetch_via_route(url: str, route: str, config: FrontierAgentConfig) -> str:
-    """Dispatch to the domain-specific backend; always falls back to Jina."""
-    if route == "pmc":
-        return await _fetch_pmc(url, config)
-    if route == "pubmed":
-        return await _fetch_pubmed(url, config)
-    if route == "biorxiv":
-        return await _fetch_biorxiv(url, config)
-    if route == "paywall":
-        return await _fetch_paywall(url, config)
+async def _fetch_via_route(
+    url: str, route: str, config: FrontierAgentConfig, *, question: str = "",
+) -> tuple[str, str]:
+    """Dispatch to the domain-specific backend; always falls back to twice.
 
-    # Generic route — Jina first, then trafilatura fallback.
-    content = ""
-    if config.jina_api_key:
-        content = await _jina_scrape(url, config.jina_api_key, config.jina_base_url)
-    if not content:
-        content = await _direct_scrape(url)
-    return content
+    Returns ``(content, answer)``. ``answer`` is twice's reply to
+    ``question`` and is only ever set on the generic route — the academic
+    backends return text from an OA API that answered no question.
+    """
+    if route == "pmc":
+        return await _fetch_pmc(url, config), ""
+    if route == "pubmed":
+        return await _fetch_pubmed(url, config), ""
+    if route == "biorxiv":
+        return await _fetch_biorxiv(url, config), ""
+    if route == "paywall":
+        return await _fetch_paywall(url, config), ""
+    return await _twice_text(url, config, question=question)
 
 
 async def _fetch_pmc(url: str, config: FrontierAgentConfig) -> str:
@@ -306,7 +328,7 @@ async def _fetch_pmc(url: str, config: FrontierAgentConfig) -> str:
         text = await fetch_pmc_fulltext(pmcid)
         if text:
             return text
-    return await _jina_or_empty(url, config)
+    return await _twice_or_empty(url, config)
 
 
 async def _fetch_pubmed(url: str, config: FrontierAgentConfig) -> str:
@@ -315,7 +337,7 @@ async def _fetch_pubmed(url: str, config: FrontierAgentConfig) -> str:
         text = await fetch_pmc_fulltext(pmcid)
         if text:
             return text
-    return await _jina_or_empty(url, config)
+    return await _twice_or_empty(url, config)
 
 
 async def _fetch_biorxiv(url: str, config: FrontierAgentConfig) -> str:
@@ -323,9 +345,9 @@ async def _fetch_biorxiv(url: str, config: FrontierAgentConfig) -> str:
     text = ""
     if pdf_url:
         logger.info("[bioRxiv] Auto PDF: %s", pdf_url)
-        text = await _jina_or_empty(pdf_url, config)
+        text = await _twice_or_empty(pdf_url, config)
     if not text or len(text) < _SHORT_CONTENT_THRESHOLD:
-        fallback = await _jina_or_empty(url, config)
+        fallback = await _twice_or_empty(url, config)
         if fallback and len(fallback) > len(text):
             text = fallback
     return text
@@ -338,23 +360,44 @@ async def _fetch_paywall(url: str, config: FrontierAgentConfig) -> str:
         oa_url = await fetch_unpaywall_oa_url(doi)
         if oa_url:
             logger.info("[Paywall bypass] %s → OA PDF: %s", url[:60], oa_url)
-            text = await _jina_or_empty(oa_url, config)
+            text = await _twice_or_empty(oa_url, config)
     if not text or len(text) < _PAYWALL_SHORT_THRESHOLD:
-        fallback = await _jina_or_empty(url, config)
+        fallback = await _twice_or_empty(url, config)
         if fallback and len(fallback) > len(text):
             text = fallback
     return text
 
 
-async def _jina_or_empty(url: str, config: FrontierAgentConfig) -> str:
-    """Run Jina with the existing retry/cache logic; empty string on failure."""
-    if not config.jina_api_key:
-        return ""
+async def _twice_or_empty(url: str, config: FrontierAgentConfig) -> str:
+    """Read ``url`` through twice; empty string on any failure."""
+    content, _ = await _twice_text(url, config)
+    return content
+
+
+async def _twice_text(
+    url: str, config: FrontierAgentConfig, *, question: str = "",
+) -> tuple[str, str]:
+    """``(content, answer)`` from twice; ``("", "")`` on any failure.
+
+    A page twice could not get past (``challenge: blocked``) is noted in the
+    per-fetch context so the caller can say so instead of "could not
+    extract"; it never raises into the academic fallback chains.
+    """
+    if not config.twice_api_key:
+        return "", ""
     try:
-        return await _jina_scrape(url, config.jina_api_key, config.jina_base_url)
+        page = await _twice_fetch(url, config, question=question)
     except Exception as exc:
-        logger.warning("Jina fetch failed for %s: %s", url[:60], exc)
-        return ""
+        logger.warning("twice fetch failed for %s: %s", url[:60], exc)
+        return "", ""
+    if page is None:
+        return "", ""
+    if page.blocked:
+        seen = _blocked_urls.get()
+        if seen is not None:
+            seen.append(url)
+        return "", ""
+    return page.content, page.answer
 
 
 async def _maybe_recover_via_unpaywall(
@@ -364,7 +407,7 @@ async def _maybe_recover_via_unpaywall(
     paywall domain, attempt one Unpaywall-driven retry.
 
     Skipped for ``pmc``/``pubmed`` — if the BioC API couldn't resolve the
-    article there's no DOI detour worth trying that Jina wouldn't already hit.
+    article there's no DOI detour worth trying that twice wouldn't already hit.
     """
     if route in ("pmc", "pubmed"):
         return content
@@ -378,7 +421,7 @@ async def _maybe_recover_via_unpaywall(
     if not garbage and not short_on_paywall:
         return content
 
-    reason = "garbage" if garbage else "short"
+    reason = "empty" if not content else ("garbage" if garbage else "short")
     logger.warning(
         "[Quality] %s content detected for %s — trying Unpaywall fallback",
         reason, url[:60],
@@ -390,247 +433,245 @@ async def _maybe_recover_via_unpaywall(
     if not oa_url:
         return content
 
-    alt = await _jina_or_empty(oa_url, config)
+    alt = await _twice_or_empty(oa_url, config)
     if alt and not is_garbage_content(alt) and len(alt) > len(content):
         logger.info("[Quality] Unpaywall fallback succeeded: %d chars", len(alt))
         return alt
     return content
 
 
-def _extract_jina_body(raw: str) -> str:
-    """Return the usable content from a Jina response body.
+# ── twice client ──────────────────────────────────────────────────────────
 
-    Jina's POST endpoint returns JSON wrapped as ``{"code":200,"status":...,
-    "data":{"title":...,"content":"markdown..."}}`` when ``Accept: application/json``
-    is set. Some proxies may return raw markdown instead. Handle both shapes
-    and also detect balance errors.
-    """
-    if not raw:
-        return ""
-    stripped = raw.lstrip()
-    if not stripped.startswith("{"):
-        return raw
-    try:
-        import json as _json
-        data = _json.loads(raw)
-    except (ValueError, TypeError):
-        return raw
-
-    if isinstance(data, dict):
-        # Balance-error sentinel.
-        if data.get("name") == "InsufficientBalanceError":
-            logger.error("Jina API: Insufficient balance")
-            return ""
-        # Wrapped success payload.
-        inner = data.get("data")
-        if isinstance(inner, dict) and isinstance(inner.get("content"), str):
-            return inner["content"]
-    return raw
-
-
-async def _jina_request(
-    url: str,
-    api_key: str,
-    base_url: str,
-    *,
-    browser: bool,
-) -> tuple[int, str]:
-    """Single Jina call. Returns (status_code, body_text). Status -1 on transport error.
-
-    ``browser=True`` switches the Jina extraction engine to ``browser`` (real
-    page render), which recovers many origins that block the direct fetch
-    engine with 403/422. Uses a longer ``X-Timeout`` so dynamic content has
-    time to load.
-    """
-    headers = {
-        "Authorization": f"Bearer {api_key}",
+def _twice_headers(config: FrontierAgentConfig) -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {config.twice_api_key}",
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "X-Timeout": "30" if browser else "20",
     }
-    if browser:
-        headers["X-Engine"] = "browser"
-        # The escalation exists because the first attempt produced nothing
-        # usable; Jina caches its own responses, so without this the retry can
-        # be answered from that same result.
-        headers["X-No-Cache"] = "true"
-
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            async with client.stream(
-                "POST",
-                base_url,
-                headers=headers,
-                json={"url": url},
-            ) as resp:
-                # Bounded read — a Jina conversion of a huge document
-                # must not buffer past the byte cap.
-                body, _ = await read_bounded(resp)
-            # One answered Jina request is billable; non-2xx
-            # statuses still consumed a reader call upstream, so count
-            # them as requests too and tag the error separately.
-            record_api_request(
-                "jina", errors=0 if resp.status_code < 400 else 1,
-            )
-            # Jina returns UTF-8 JSON but omits ``charset`` in Content-Type,
-            # which makes httpx fall back to chardet sniffing — chardet
-            # mis-classifies CJK-heavy bodies with mostly-ASCII headers as
-            # Windows-1252, producing mojibake like ``千と千尋`` →
-            # ``åã¨åå°``. Force UTF-8 to skip the sniff entirely.
-            return resp.status_code, body.decode("utf-8", errors="replace")
-    except httpx.TimeoutException:
-        record_api_request("jina", requests=0, errors=1)
-        return -1, "timeout"
-    except Exception as e:
-        logger.error("Jina transport error for %s: %s", url[:60], e)
-        record_api_request("jina", requests=0, errors=1)
-        return -1, str(e)
 
 
-async def _jina_scrape(url: str, api_key: str, base_url: str) -> str:
-    """Scrape via Jina Reader with escalation retry.
+async def _twice_fetch(
+    url: str, config: FrontierAgentConfig, *, question: str = "",
+) -> _TwicePage | None:
+    """One page through ``POST /v1/fetch``; ``None`` when it could not be read.
 
-    Strategy:
-    1. Default (fast) engine first.
-    2. On 403/422, escalate once to ``X-Engine: browser`` — covers SPAs and
-       origins that block the direct fetch engine. Only caches the URL as
-       banned if the browser-engine attempt also fails.
-    3. Also escalate on a 200 whose body came back un-rendered: an SPA that had
-       not hydrated when the reader captured it answers 200 with a
-       navigation-only DOM, so a status-only rule never noticed (see
-       ``_render_check``). The retry additionally bypasses Jina's own response
-       cache, which would otherwise hand back the same shell.
-    4. Retry 429/5xx with exponential backoff (unchanged).
+    A 202 (challenge page / PDF still rendering after ``wait``) is followed
+    through ``GET /v1/runs/<id>/wait`` until the run is terminal, then the
+    text is downloaded from ``verdict.page.content_url``. 429/5xx/transport
+    errors retry with backoff; anything else from the service (bad key, plan
+    limit) is a configuration problem and aborts without retry.
     """
-    escalated = False
+    base = (config.twice_base_url or "https://twice.sh").rstrip("/")
+    headers = _twice_headers(config)
+    body: dict[str, Any] = {
+        "url": url,
+        "format": "markdown",
+        "wait": _TWICE_WAIT_S,
+        "max_chars": _TWICE_MAX_CHARS,
+    }
+    if question:
+        body["question"] = question[:_TWICE_MAX_QUESTION_CHARS]
 
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _TWICE_DEADLINE_S
+    timeout = httpx.Timeout(_TWICE_WAIT_S + 30, connect=20)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        data = await _twice_post(client, base, headers, body, url)
+        if data is None:
+            return None
+        if data.get("status") in _TWICE_RUNNING_STATES:
+            run_id = str(data.get("run_id") or "")
+            if not run_id:
+                logger.error("twice answered 202 without a run_id for %s", url[:60])
+                return None
+            data = await _twice_wait(client, base, headers, run_id, url, deadline)
+            if data is None:
+                return None
+    return _twice_page_from(data, url)
+
+
+async def _twice_post(
+    client: httpx.AsyncClient,
+    base: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    url: str,
+) -> dict[str, Any] | None:
     for attempt in range(_MAX_RETRIES):
-        status, body = await _jina_request(url, api_key, base_url, browser=escalated)
+        try:
+            resp = await client.post(
+                f"{base}{_TWICE_FETCH_PATH}", headers=headers, json=body,
+            )
+        except httpx.TimeoutException:
+            record_api_request("twice", requests=0, errors=1)
+            logger.warning(
+                "twice timeout for %s (attempt %d)", url[:60], attempt + 1,
+            )
+            resp = None
+        except httpx.HTTPError as exc:
+            record_api_request("twice", requests=0, errors=1)
+            logger.warning(
+                "twice transport error for %s: %s (attempt %d)",
+                url[:60], exc, attempt + 1,
+            )
+            resp = None
 
-        if status == 200:
-            content = _extract_jina_body(body)
-            kind = unrendered_kind(content)
-            if kind is not None and not escalated:
-                logger.info(
-                    "Jina returned an un-rendered page for %s (%s, %d chars) "
-                    "— escalating to browser engine", url[:60], kind, len(content),
+        if resp is not None:
+            if resp.status_code in (200, 202):
+                record_api_request("twice")
+                try:
+                    data = resp.json()
+                except ValueError:
+                    logger.error("twice returned non-JSON for %s", url[:60])
+                    return None
+                return data if isinstance(data, dict) else None
+            record_api_request("twice", errors=1)
+            if resp.status_code != 429 and resp.status_code < 500:
+                # Bad key, plan limit, malformed request: retrying cannot help.
+                logger.error(
+                    "twice HTTP %d for %s (body: %s)",
+                    resp.status_code, url[:60], resp.text[:200],
                 )
-                escalated = True
-                continue
-            return content
+                return None
+            logger.warning(
+                "twice HTTP %d for %s (attempt %d)",
+                resp.status_code, url[:60], attempt + 1,
+            )
 
-        if status == 403:
-            if not escalated:
-                logger.info("Jina 403 for %s — escalating to browser engine", url[:60])
-                escalated = True
-                continue
-            _scrape_cache.record_failure(url, 403)
-            logger.warning("Jina 403 for %s after browser retry — cached (1h)", url[:60])
-            return ""
+        if attempt < _MAX_RETRIES - 1:
+            await asyncio.sleep(2 ** attempt)
+    logger.error("twice fetch exhausted retries for %s", url[:60])
+    return None
 
-        if status == 422:
-            if not escalated:
-                logger.info("Jina 422 for %s — escalating to browser engine", url[:60])
-                escalated = True
-                continue
-            _scrape_cache.record_failure(url, 422)
-            logger.info("Jina 422 for %s after browser retry — recorded", url[:60])
-            return ""
 
-        if status == 429:
-            wait = 2 ** attempt
-            logger.warning("Jina 429 rate limited for %s, retrying in %ds", url[:60], wait)
-            await asyncio.sleep(wait)
+async def _twice_wait(
+    client: httpx.AsyncClient,
+    base: str,
+    headers: dict[str, str],
+    run_id: str,
+    url: str,
+    deadline: float,
+) -> dict[str, Any] | None:
+    """Long-poll a 202 run to a terminal state; return a ``/v1/fetch``-shaped dict."""
+    loop = asyncio.get_running_loop()
+    transport_failures = 0
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.warning(
+                "twice run %s for %s still running after %ds — giving up",
+                run_id, url[:60], _TWICE_DEADLINE_S,
+            )
+            return None
+        poll = int(max(1, min(_TWICE_POLL_S, remaining)))
+        try:
+            resp = await client.get(
+                f"{base}/v1/runs/{run_id}/wait",
+                params={"timeout": poll},
+                headers=headers,
+                timeout=httpx.Timeout(poll + 30, connect=20),
+            )
+        except httpx.HTTPError as exc:
+            transport_failures += 1
+            record_api_request("twice", requests=0, errors=1)
+            logger.warning("twice poll error for %s: %s", url[:60], exc)
+            if transport_failures >= _MAX_RETRIES:
+                return None
+            await asyncio.sleep(2 ** transport_failures)
             continue
-
-        if status >= 500:
-            wait = 2 ** attempt
-            logger.warning("Jina %d server error for %s, retrying in %ds", status, url[:60], wait)
-            await asyncio.sleep(wait)
+        if resp.status_code != 200:
+            record_api_request("twice", errors=1)
+            logger.error(
+                "twice poll HTTP %d for run %s (%s)", resp.status_code, run_id, url[:60],
+            )
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            logger.error("twice poll returned non-JSON for run %s", run_id)
+            return None
+        if not isinstance(data, dict):
+            return None
+        status = str(data.get("status") or "")
+        if status in _TWICE_RUNNING_STATES:
             continue
+        if status != "completed" or data.get("error"):
+            logger.warning(
+                "twice run %s for %s ended %s: %s",
+                run_id, url[:60], status or "unknown", data.get("error"),
+            )
+            return None
+        verdict = data.get("verdict") or {}
+        page = verdict.get("page") if isinstance(verdict, dict) else None
+        if not isinstance(page, dict):
+            page = {}
+        content = ""
+        content_url = page.get("content_url")
+        if isinstance(content_url, str) and content_url:
+            content = await _twice_download(client, base, headers, content_url, url)
+        return {"status": "completed", "page": page, "content": content}
 
-        if status == -1:
-            # Transport error / timeout — treat like a soft retry.
-            logger.warning("Jina transport failure for %s: %s (attempt %d)", url[:60], body[:60], attempt + 1)
-            if attempt < _MAX_RETRIES - 1:
-                await asyncio.sleep(1)
-                continue
-            return ""
 
-        # Any other status — log and abort without caching.
-        logger.error("Jina HTTP %d for %s (body: %s)", status, url[:60], body[:200])
+async def _twice_download(
+    client: httpx.AsyncClient,
+    base: str,
+    headers: dict[str, str],
+    content_url: str,
+    url: str,
+) -> str:
+    """Fetch the finished run's text. Only the service's own origin gets our key."""
+    if urlsplit(content_url)[:2] != urlsplit(base)[:2]:
+        logger.error(
+            "twice content_url %s is not on %s — refusing to send credentials",
+            content_url[:80], base,
+        )
         return ""
-
-    # Retries exhausted on 429/5xx — record as rate-limited so we back off.
-    _scrape_cache.record_failure(url, 429)
-    logger.error("Jina scrape exhausted retries for %s — cached 429 (5min)", url[:60])
-    return ""
-
-
-async def _direct_scrape(url: str) -> str:
-    """Direct scrape with httpx + trafilatura extraction."""
     try:
-        import trafilatura
-    except ImportError:
-        return ""
-
-    try:
-        headers = {
-            # Sent to every site this scrapes. Identify your deployment
-            # here if you want operators to be able to contact you — the
-            # default names the project, not any account.
-            "User-Agent": (
-                "Mozilla/5.0 (compatible; FrontierAgent/1.0; "
-                "+https://github.com/ApodexAI/FrontierAgent)"
-            ),
-        }
-        # Redirects are walked by hand so every hop is vetted: following them
-        # automatically would let a vetted public URL hand us a 302 to
-        # localhost or a metadata endpoint (see ``next_hop``).
-        async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
-            hop_url, hop_headers = url, headers
-            for _ in range(MAX_REDIRECT_HOPS):
-                refusal, addresses = await vet_public_url(hop_url)
-                if refusal:
-                    raise RedirectRefused(refusal)
-                dial_url, dial_headers, extensions = pin_to_address(
-                    hop_url, addresses, hop_headers,
+        async with client.stream(
+            "GET", content_url, headers={"Authorization": headers["Authorization"]},
+        ) as resp:
+            if resp.status_code != 200:
+                record_api_request("twice", errors=1)
+                logger.error(
+                    "twice content download HTTP %d for %s", resp.status_code, url[:60],
                 )
-                async with client.stream(
-                    "GET", dial_url, headers=dial_headers, extensions=extensions,
-                ) as resp:
-                    target = await next_hop(resp, hop_url)
-                    if target is not None:
-                        hop_headers = strip_cross_origin_credentials(
-                            hop_headers, hop_url, target,
-                        )
-                        hop_url = target
-                        continue
-                    resp.raise_for_status()
-                    # A data blob (dataset zip, media) has no page text for
-                    # trafilatura; skip the download instead of buffering it.
-                    if binary_content_type(resp.headers.get("content-type")):
-                        logger.warning(
-                            "Direct scrape skipped binary content for %s", url[:60],
-                        )
-                        return ""
-                    body, _ = await read_bounded(resp)
-                    break
-            else:
-                logger.warning("Direct scrape exceeded redirect limit for %s", url[:60])
                 return ""
-    except RedirectRefused as exc:
-        logger.warning("Direct scrape refused a redirect for %s: %s", url[:60], exc)
+            body, _ = await read_bounded(resp)
+    except httpx.HTTPError as exc:
+        record_api_request("twice", requests=0, errors=1)
+        logger.warning("twice content download failed for %s: %s", url[:60], exc)
         return ""
-    except httpx.TimeoutException:
-        logger.warning("Direct scrape timeout for %s", url[:60])
-        return ""
-    except Exception as e:
-        logger.warning("Direct scrape failed for %s: %s", url[:60], e)
-        return ""
+    # The service writes UTF-8 markdown; skip charset sniffing (chardet
+    # mis-classifies CJK-heavy bodies with ASCII headers as Windows-1252).
+    return body.decode("utf-8", errors="replace")
 
-    # Pass raw bytes so trafilatura reads the HTML ``<meta charset>``
-    # itself instead of trusting httpx's chardet sniff — pages that mix
-    # heavy ASCII boilerplate with a small CJK payload get mis-classified
-    # as Windows-1252 by chardet (UTF-8 → mojibake).
-    return trafilatura.extract(body) or ""
+
+def _twice_page_from(data: dict[str, Any], url: str) -> _TwicePage | None:
+    page = data.get("page")
+    if not isinstance(page, dict):
+        page = {}
+    content = data.get("content")
+    if not isinstance(content, str):
+        content = ""
+    try:
+        status = int(page.get("status") or 0)
+    except (TypeError, ValueError):
+        status = 0
+    challenge = str(page.get("challenge") or "none")
+    title = str(page.get("title") or "")
+    answer = page.get("answer")
+    answer = answer.strip() if isinstance(answer, str) else ""
+
+    if challenge == "blocked":
+        logger.warning(
+            "twice: %s blocks automated access (HTTP %d, challenge blocked)",
+            url[:60], status,
+        )
+        return _TwicePage(content="", title=title, status=status, challenge=challenge)
+    if status >= 400:
+        # The origin answered with an error page; its body is not the page.
+        logger.warning("twice: HTTP %d from origin for %s", status, url[:60])
+        return None
+    return _TwicePage(
+        content=content, title=title, answer=answer, status=status, challenge=challenge,
+    )

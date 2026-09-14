@@ -26,6 +26,7 @@ def _profile(**overrides):
         "base_url_env": "OPENAI_BASE_URL",
         "model_env": "OPENAI_MODEL",
         "tool_names": (),
+        "web_fetch_impl": "original",
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -96,11 +97,20 @@ def test_search_credentials_are_checked_when_the_profile_binds_the_web_tools():
     # Both warn: a coding session that never searches must still start.
     assert web.ok
     assert [issue.code for issue in web.warnings] == [
-        "missing_serper_api_key", "missing_jina_api_key",
+        "missing_serper_api_key", "missing_twice_api_key",
     ]
     rendered = format_runtime_config_status(web)
     assert "warning: SERPER_API_KEY" in rendered
-    assert "warning: JINA_API_KEY" in rendered
+    assert "warning: TWICE_API_KEY" in rendered
+
+    # The react profile binds the aligned implementation, which still reads
+    # pages through Jina Reader — so that is the key it asks for.
+    aligned = inspect_runtime_config(
+        cfg,
+        profile=_profile(tool_names=_WEB_TOOLS, web_fetch_impl="aligned"),
+        environ={"SERPER_API_KEY": "search-secret", "TWICE_API_KEY": "tw_x"},
+    )
+    assert [issue.code for issue in aligned.warnings] == ["missing_jina_api_key"]
 
     with_search = inspect_runtime_config(
         cfg,
@@ -108,7 +118,7 @@ def test_search_credentials_are_checked_when_the_profile_binds_the_web_tools():
         environ={"SERPER_API_KEY": "search-secret"},
     )
     assert with_search.ok
-    assert [issue.code for issue in with_search.warnings] == ["missing_jina_api_key"]
+    assert [issue.code for issue in with_search.warnings] == ["missing_twice_api_key"]
 
     no_web_tools = inspect_runtime_config(
         cfg, profile=_profile(tool_names=("bash", "read_file")), environ={},
@@ -170,7 +180,7 @@ def test_closed_book_env_suppresses_search_credential_warnings():
         environ={"SWARM_NO_WEB": "1"},
     )
     assert [i.code for i in react_wrong_flag.warnings] == [
-        "missing_serper_api_key", "missing_jina_api_key",
+        "missing_serper_api_key", "missing_twice_api_key",
     ]
 
     swarm_wrong_flag = inspect_runtime_config(
@@ -180,7 +190,7 @@ def test_closed_book_env_suppresses_search_credential_warnings():
         environ={"REACT_NO_WEB": "1"},
     )
     assert [i.code for i in swarm_wrong_flag.warnings] == [
-        "missing_serper_api_key", "missing_jina_api_key",
+        "missing_serper_api_key", "missing_twice_api_key",
     ]
 
     # Unknown modes have no closed-book gate: the generic loop still binds web
@@ -192,7 +202,7 @@ def test_closed_book_env_suppresses_search_credential_warnings():
         environ={"REACT_NO_WEB": "1", "SWARM_NO_WEB": "1"},
     )
     assert [i.code for i in generic.warnings] == [
-        "missing_serper_api_key", "missing_jina_api_key",
+        "missing_serper_api_key", "missing_twice_api_key",
     ]
 
 
@@ -205,6 +215,7 @@ def test_closed_book_filtering_covers_both_shipped_modes(monkeypatch):
 
     P._CACHE.clear()
     P._workflow_tool_names.cache_clear()
+    P._workflow_web_fetch_impl.cache_clear()
     monkeypatch.delenv("REACT_NO_WEB", raising=False)
     monkeypatch.delenv("SWARM_NO_WEB", raising=False)
 
@@ -217,7 +228,11 @@ def test_closed_book_filtering_covers_both_shipped_modes(monkeypatch):
         assert "web_fetch" in profile.tool_names, mode
         status = inspect_runtime_config(cfg, profile=profile, mode=mode, environ={})
         assert "missing_serper_api_key" in [i.code for i in status.warnings], mode
-        assert "missing_jina_api_key" in [i.code for i in status.warnings], mode
+        expected_key = (
+            "missing_jina_api_key" if profile.web_fetch_impl == "aligned"
+            else "missing_twice_api_key"
+        )
+        assert expected_key in [i.code for i in status.warnings], mode
 
         # Closed-book via the live environment (what ``tool_names`` reads).
         monkeypatch.setenv(flag, "1")

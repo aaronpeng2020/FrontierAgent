@@ -12,9 +12,9 @@ from plugins.tools._render_check import (
 def test_academic_routes_validate_the_parsed_hostname() -> None:
     assert route_url("https://pmc.ncbi.nlm.nih.gov/articles/PMC1/") == "pmc"
     assert route_url("https://subdomain.biorxiv.org/content/1") == "biorxiv"
-    assert route_url("https://pmc.ncbi.nlm.nih.gov.evil.test/PMC1") == "jina"
-    assert route_url("https://biorxiv.org@evil.test/content/1") == "jina"
-    assert route_url("https://[") == "jina"
+    assert route_url("https://pmc.ncbi.nlm.nih.gov.evil.test/PMC1") == "generic"
+    assert route_url("https://biorxiv.org@evil.test/content/1") == "generic"
+    assert route_url("https://[") == "generic"
 
 
 def test_biorxiv_pdf_conversion_rejects_hostname_confusion() -> None:

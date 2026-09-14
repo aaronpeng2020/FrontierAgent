@@ -12,7 +12,7 @@ from frontier_agent.infra.config import get_config
 
 logger = logging.getLogger(__name__)
 
-Route = Literal["pmc", "pubmed", "biorxiv", "paywall", "jina"]
+Route = Literal["pmc", "pubmed", "biorxiv", "paywall", "generic"]
 
 # Paywall / anti-bot domains that need Unpaywall detour.
 PAYWALL_DOMAINS: frozenset[str] = frozenset({
@@ -82,9 +82,9 @@ def route_url(url: str) -> Route:
         parsed = urlparse(url)
         domain = parsed.hostname or ""
     except ValueError:
-        return "jina"
+        return "generic"
     if parsed.scheme.lower() not in {"http", "https"}:
-        return "jina"
+        return "generic"
     if _is_domain(domain, "pmc.ncbi.nlm.nih.gov"):
         return "pmc"
     if _is_domain(domain, "pubmed.ncbi.nlm.nih.gov"):
@@ -93,7 +93,7 @@ def route_url(url: str) -> Route:
         return "biorxiv"
     if domain in PAYWALL_DOMAINS:
         return "paywall"
-    return "jina"
+    return "generic"
 
 
 def is_garbage_content(text: str) -> bool:

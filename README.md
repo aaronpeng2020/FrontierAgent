@@ -147,6 +147,9 @@ OPENAI_MODEL=your-model-name
 
 # Optional web research tools
 SERPER_API_KEY=
+# web_fetch reads pages through twice (https://twice.sh)
+TWICE_API_KEY=
+# the react profile's aligned web_fetch still uses Jina Reader
 JINA_API_KEY=
 ```
 

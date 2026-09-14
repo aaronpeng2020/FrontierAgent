@@ -52,9 +52,8 @@ _WORKFLOW_PROFILE_LOADERS = {
 _WORKFLOW_TOOL_KEYS = ("agent_tools", "main_agent_tools", "sub_agent_tools")
 
 
-@cache
-def _workflow_tool_names(workflow: str, workflow_profile: str) -> tuple[str, ...]:
-    """The tools ``workflow`` binds under ``workflow_profile``.
+def _load_workflow_agent(workflow: str, workflow_profile: str) -> dict[str, Any]:
+    """The ``agent:`` block of ``workflow``'s ``workflow_profile`` (``{}`` if unreadable).
 
     Resolved through the workflow's own loader rather than by reading the YAML
     path, so profile aliases, ``${VAR}`` expansion and shipped overrides give
@@ -63,7 +62,7 @@ def _workflow_tool_names(workflow: str, workflow_profile: str) -> tuple[str, ...
     """
     entry = _WORKFLOW_PROFILE_LOADERS.get(workflow)
     if entry is None or not workflow_profile:
-        return ()
+        return {}
     module_path, loader_name = entry
     # The loaders log their own config diagnostics (provider label mismatches,
     # empty keys). Dispatch loads the same profile again and logs them there,
@@ -77,11 +76,25 @@ def _workflow_tool_names(workflow: str, workflow_profile: str) -> tuple[str, ...
     except Exception:
         # A preflight reports on the run; it must never be the thing that stops
         # one. An unreadable workflow profile simply checks no tool credentials.
-        return ()
+        return {}
     finally:
         logging.disable(previous)
+    return dict(agent) if isinstance(agent, dict) else {}
+
+
+@cache
+def _workflow_tool_names(workflow: str, workflow_profile: str) -> tuple[str, ...]:
+    """The tools ``workflow`` binds under ``workflow_profile``."""
+    agent = _load_workflow_agent(workflow, workflow_profile)
     names = [str(t) for key in _WORKFLOW_TOOL_KEYS for t in (agent.get(key) or [])]
     return tuple(dict.fromkeys(names))
+
+
+@cache
+def _workflow_web_fetch_impl(workflow: str, workflow_profile: str) -> str:
+    """``web_fetch_impl`` of the workflow profile: ``aligned`` or ``original``."""
+    agent = _load_workflow_agent(workflow, workflow_profile)
+    return "aligned" if agent.get("web_fetch_impl") == "aligned" else "original"
 
 
 @dataclass(frozen=True)
@@ -141,6 +154,15 @@ class AgentProfile:
             keep = set(effective)
             return tuple(t for t in raw if t in keep)
         return self.declared_tools
+
+    @property
+    def web_fetch_impl(self) -> str:
+        """Which ``web_fetch`` the profile runs: ``aligned`` (Jina Reader +
+        SUMMARY_LLM extraction) or ``original`` (twice.sh). Decides which
+        credential the preflight asks for."""
+        if self.workflow:
+            return _workflow_web_fetch_impl(self.workflow, self.workflow_profile or "")
+        return "original"
 
     def runtime_config(
         self, cfg: ModelConfig, *, mode: str | None = None,

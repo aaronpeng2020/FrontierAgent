@@ -235,13 +235,29 @@ def inspect_runtime_config(
             # and must not be refused a startup over it.
             blocking=False,
         ))
-    if "web_fetch" in tool_names and not _configured(env.get("JINA_API_KEY")):
+    # The two shipped implementations read pages through different services:
+    # ``aligned`` (react) via Jina Reader, ``original`` (agent_team) via
+    # twice.sh. Ask for the key the bound implementation actually uses.
+    web_fetch_impl = getattr(profile, "web_fetch_impl", "original")
+    if "web_fetch" in tool_names and web_fetch_impl == "aligned":
+        if not _configured(env.get("JINA_API_KEY")):
+            issues.append(RuntimeConfigIssue(
+                code="missing_jina_api_key",
+                message=(
+                    "JINA_API_KEY is missing; web_fetch will use its direct-fetch "
+                    "fallback."
+                ),
+                env_var="JINA_API_KEY",
+                blocking=False,
+            ))
+    elif "web_fetch" in tool_names and not _configured(env.get("TWICE_API_KEY")):
         issues.append(RuntimeConfigIssue(
-            code="missing_jina_api_key",
+            code="missing_twice_api_key",
             message=(
-                "JINA_API_KEY is missing; web_fetch will use its direct-fetch fallback."
+                "TWICE_API_KEY is not set; web_fetch cannot read web pages "
+                "(it renders them through https://twice.sh)."
             ),
-            env_var="JINA_API_KEY",
+            env_var="TWICE_API_KEY",
             blocking=False,
         ))
 

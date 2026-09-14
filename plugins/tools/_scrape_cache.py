@@ -1,112 +1,18 @@
-"""In-process negative cache for web scrape URLs."""
+"""In-process positive cache for web scrape content (single-flight)."""
 
 from __future__ import annotations
 
 import asyncio
 import os
-import threading
-import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
 
 from frontier_agent.infra.usage_meter import record_api_request
-
-# ── Tunables ──────────────────────────────────────────────────────────────
-
-# Ban durations per status (seconds).
-_BAN_403 = 3600           # 1 hour — matches Jina's rolling window.
-_BAN_422 = 1800           # 30 min — paywall/SPA/empty content.
-_BAN_429 = 300            # 5 min — transient rate limit.
-
-# Minimum consecutive failures before a 422 results in a ban.
-# 403 and 429 ban on the first occurrence.
-_MIN_FAILS_422 = 2
-
-# Status codes we track. Everything else is not cached.
-_TRACKED_STATUSES = {403, 422, 429}
-
-
-@dataclass
-class _Entry:
-    status: int
-    fail_count: int = 0
-    ban_until: float = 0.0      # unix time; 0 means not banned
-    last_failed_at: float = field(default_factory=time.time)
-
-
-class _ScrapeCache:
-    """Thread-safe negative cache for scrape URLs."""
-
-    def __init__(self) -> None:
-        self._data: dict[str, _Entry] = {}
-        self._lock = threading.Lock()
-
-    def check(self, url: str, now: float | None = None) -> _Entry | None:
-        """Return active entry if URL is currently banned, else None."""
-        if not url:
-            return None
-        t = now if now is not None else time.time()
-        with self._lock:
-            entry = self._data.get(url)
-            if entry is None:
-                return None
-            if entry.ban_until > t:
-                return entry
-            # Expired — drop it so future failures start fresh.
-            if entry.ban_until and entry.ban_until <= t:
-                self._data.pop(url, None)
-            return None
-
-    def record_failure(self, url: str, status: int, now: float | None = None) -> _Entry | None:
-        """Record a failure; set ban_until if rules trigger. Returns updated entry."""
-        if not url or status not in _TRACKED_STATUSES:
-            return None
-        t = now if now is not None else time.time()
-        with self._lock:
-            entry = self._data.get(url)
-            if entry is None or entry.status != status:
-                # Reset counter if status changed (e.g., 429 → 403).
-                entry = _Entry(status=status, fail_count=0, last_failed_at=t)
-            entry.fail_count += 1
-            entry.last_failed_at = t
-            entry.status = status
-
-            if status == 403:
-                entry.ban_until = t + _BAN_403
-            elif status == 429:
-                entry.ban_until = t + _BAN_429
-            elif status == 422 and entry.fail_count >= _MIN_FAILS_422:
-                entry.ban_until = t + _BAN_422
-
-            self._data[url] = entry
-            return entry
-
-    def record_success(self, url: str) -> None:
-        """Clear any prior failure record for this URL."""
-        if not url:
-            return
-        with self._lock:
-            self._data.pop(url, None)
-
-    def clear(self) -> None:
-        """Drop all entries. Primarily for tests."""
-        with self._lock:
-            self._data.clear()
-
-    def size(self) -> int:
-        with self._lock:
-            return len(self._data)
-
-
-# Module-level singleton. Callers should import this directly.
-cache = _ScrapeCache()
-
 
 # ── Positive scrape cache (cross-run, single-flight) ───────────────────────
 #
 # The negative cache above only suppresses re-hammering KNOWN-BAD URLs. This
 # positive cache stores SUCCESSFUL scrape content so the same URL fetched by
-# many sibling agents costs one Jina round-trip, not N.
+# many sibling agents costs one upstream round-trip, not N.
 #
 # Why it pays: sibling agents researching one question converge on the same
 # canonical pages, so unique URLs run far below total fetches (typically a
@@ -186,7 +92,7 @@ class ScrapeResultCache:
         async with self._lock:
             if url in self._content:
                 self.hits += 1
-                # A cache hit is one Jina round-trip saved.
+                # A cache hit is one upstream round-trip saved.
                 record_api_request("jina", requests=0, cache_hits=1)
                 return self._content[url]
             fut = self._inflight.get(url)
@@ -259,19 +165,3 @@ class ScrapeResultCache:
 
 # Module-level singleton — shared across all sibling agents in the process.
 scrape_result_cache = ScrapeResultCache()
-
-
-def format_skip_message(url: str, entry: _Entry, now: float | None = None) -> str:
-    """Format a short, LLM-facing message explaining why the URL was skipped."""
-    t = now if now is not None else time.time()
-    remaining = max(0, int(entry.ban_until - t))
-    mins = remaining // 60
-    reason = {
-        403: "returned 403 (origin blocked or Jina URL ban)",
-        422: f"returned 422 {entry.fail_count}x (paywall, empty, or unparseable content)",
-        429: "was rate-limited (429)",
-    }.get(entry.status, f"failed with status {entry.status}")
-    return (
-        f"URL skipped: {url} {reason} earlier in this session. "
-        f"Cached for ~{mins} more min. Try a different source or search query."
-    )

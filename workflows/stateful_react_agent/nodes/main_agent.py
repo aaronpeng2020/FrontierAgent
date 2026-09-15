@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-import re
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -89,6 +89,11 @@ from workflows.stateful_react_agent._runtime import (
     _strip_thinking,
     render_system_prompt_notes,
 )
+from workflows.stateful_react_agent.bank import (
+    BANK_PROMPT_ADDENDUM,
+    BankCompactor,
+    BankReportObserver,
+)
 from workflows.stateful_react_agent.observers import (
     FinalAnswerSalvageObserver,
     ReporterStreamObserver,
@@ -100,6 +105,8 @@ from workflows.stateful_react_agent.prompts import (
     get_direct_system_prompt,
     get_react_system_prompt,
 )
+from workflows.stateful_react_agent.rounds import RoundsCompactor, RoundsPolicy
+from workflows.stateful_react_agent.verify import LocalVerifierObserver
 
 logger = logging.getLogger(__name__)
 
@@ -573,7 +580,7 @@ def _looks_unfinished(text: str, task_id: str) -> bool:
         return True
     try:
         return unresolved_count(task_id) > 0
-    except Exception:  # noqa: BLE001
+    except Exception:
         return False
 
 
@@ -699,7 +706,22 @@ async def react_agent_node(state: dict[str, Any], ctx: NodeContext) -> dict[str,
     #     ``max_len`` * 0.8; Tier1 keeps the last ``tier1_keep_tool_result`` tool
     #     results (drops older), Tier2 LLM-summarises the middle only if Tier1
     #     left the estimate above max_len*0.6. ``max_len`` = model context window.
+    #   "rounds"        → IterResearch-style: every ``rounds_k`` turns (or at the
+    #     tiered trigger, whichever first) the history is rebuilt from ONE
+    #     evolving report (see ``rounds.py``); ``rounds_keep_recent_turns`` of raw
+    #     tail survive, ``rounds_max_words`` bounds the report.
     context_compaction = str(agent_cfg.get("context_compaction", "off")).lower()
+    rounds_k = int(agent_cfg.get("rounds_k", 8) or 8)
+    rounds_keep_recent_turns = int(agent_cfg.get("rounds_keep_recent_turns", 2) or 2)
+    rounds_max_words = int(agent_cfg.get("rounds_max_words", 1500) or 1500)
+    #   "bank"          → rounds whose memory is an evidence bank on disk plus an
+    #     outline citing it (see ``bank.py``); adds the ``save_evidence`` tool and
+    #     writes the final report section by section from the bank.
+    bank_mode = context_compaction == "bank"
+    # Local verifier (``verify.py``): every ``local_verifier_k`` turns a side call
+    # audits the round and may inject a short steer. Off unless the profile opts in.
+    local_verifier = _flag(agent_cfg.get("local_verifier"), default=False)
+    local_verifier_k = int(agent_cfg.get("local_verifier_k", rounds_k) or rounds_k)
     compaction_spill = _flag(agent_cfg.get("compaction_spill"), default=False)
     max_len = int(agent_cfg.get("max_len", 0) or 0)
     # See the sibling call in agent_team: the sglang doctor covers the compose
@@ -846,6 +868,10 @@ async def react_agent_node(state: dict[str, Any], ctx: NodeContext) -> dict[str,
     )
 
     resource_mgr = registry.get(ResourceManager)
+    if bank_mode and agent_cfg.get("agent_tools"):
+        # The bank arm needs its filing tool; only that arm gets it, so the
+        # other profiles' explicit allowlists stay as they are.
+        agent_cfg = {**agent_cfg, "agent_tools": [*list(agent_cfg["agent_tools"]), "save_evidence"]}
     tools = _replace_tool_impls(
         _tools_for_stateful_react(resource_mgr, agent_cfg),
         agent_cfg,
@@ -866,6 +892,8 @@ async def react_agent_node(state: dict[str, Any], ctx: NodeContext) -> dict[str,
     # task-board + sandbox-FS notes are tool-dependent — skip them in direct mode.
     if task_board and not direct:
         system_prompt = f"{system_prompt}{BOARD_PROMPT_ADDENDUM}"
+    if bank_mode and not direct:
+        system_prompt = f"{system_prompt}{BANK_PROMPT_ADDENDUM}"
     if reporter_enabled:
         # Keep the research agent's draft/salvage answer in the same language
         # as the reporter.  This also makes the fail-open path language-stable
@@ -894,6 +922,11 @@ async def react_agent_node(state: dict[str, Any], ctx: NodeContext) -> dict[str,
         sandbox_binds, outputs_dir = _resolve_sandbox_binds(state, worktree_root)
     worktree_root.mkdir(parents=True, exist_ok=True)
     outputs_dir.mkdir(parents=True, exist_ok=True)
+    evidence_root = worktree_root / "evidence"
+    if bank_mode:
+        from plugins.tools._evidence import EVIDENCE_DIR
+
+        EVIDENCE_DIR.set(str(evidence_root))
 
     # /inputs is an external bind-mount (Worker Shell syncs it from S3); the
     # harness never populates it. Log what actually landed there so a
@@ -980,7 +1013,7 @@ async def react_agent_node(state: dict[str, Any], ctx: NodeContext) -> dict[str,
     if max_input_tokens > 0:
         observers.append(ContextSizeGuard(
             max_input_tokens=max_input_tokens,
-            force_compaction_first=(context_compaction == "tiered" and max_len > 0),
+            force_compaction_first=(context_compaction in ("tiered", "rounds", "bank") and max_len > 0),
         ))
     # Stop-loss, both no-ops unless the profile opts in (see above).
     if stuck_hint_after > 0 and not direct:
@@ -1037,7 +1070,22 @@ async def react_agent_node(state: dict[str, Any], ctx: NodeContext) -> dict[str,
     #   otherwise        → ReporterStreamObserver: re-streams the raw resolved
     #     answer (no-op without an emitter, so wire it only when one is present).
     sdk_emitter = metadata.get("sdk_protocol_emitter")
-    if reporter_enabled:
+    if reporter_enabled and bank_mode:
+        # The bank arm's report is written from the saved evidence, section by
+        # section, instead of one synthesis call over the whole conversation.
+        observers.append(BankReportObserver(
+            llm=llm,
+            task=question,
+            evidence_root=evidence_root,
+            language=answer_language,
+            timeout=reporter_timeout_s,
+            emitter=sdk_emitter,
+            usage_aggregator=metadata.get("sdk_protocol_usage_aggregator"),
+            thinking_format=(
+                model_profile.thinking_format if model_profile is not None else "tag"
+            ),
+        ))
+    elif reporter_enabled:
         thinking_fmt = (
             model_profile.thinking_format if model_profile is not None else "tag"
         )
@@ -1109,8 +1157,34 @@ async def react_agent_node(state: dict[str, Any], ctx: NodeContext) -> dict[str,
         compaction_policy = InputTokenThresholdPolicy(
             gauge, compaction_trigger_tokens(max_len),
         )
+    elif context_compaction in ("rounds", "bank"):
+        # Same gauge as tiered: the cadence is the behaviour, the token trigger
+        # only keeps one oversized round from blowing the window.
+        gauge = InputTokenGauge()
+        observers.append(gauge)
+        rounds_policy = RoundsPolicy(
+            rounds_k, gauge=gauge,
+            token_trigger=compaction_trigger_tokens(max_len) if max_len > 0 else 0,
+        )
+        rounds_kwargs: dict[str, Any] = dict(
+            summary_llm=llm,
+            task=question,
+            policy=rounds_policy,
+            keep_recent_msgs=max(3, rounds_keep_recent_turns * 3),
+            max_words=rounds_max_words,
+            timeout_s=llm_timeout,
+        )
+        if bank_mode:
+            compactor = BankCompactor(evidence_root=evidence_root, **rounds_kwargs)
+        else:
+            compactor = RoundsCompactor(report_path=worktree_root / "report.md", **rounds_kwargs)
+        compaction_policy = rounds_policy
     else:
         compactor = KeepLastNToolResultsCompactor(keep_tool_result=keep_last_k)
+    if local_verifier and not direct:
+        observers.append(LocalVerifierObserver(
+            llm=llm, task=question, k=local_verifier_k, timeout_s=llm_timeout,
+        ))
 
     try:
         import sys

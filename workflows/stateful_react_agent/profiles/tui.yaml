@@ -61,7 +61,19 @@ agent:
   thinking_format: tag
   thinking_in_history: true
   # Compact near 80% of max_len, preserving five recent results and turns.
-  context_compaction: tiered
+  # AGENT_CONTEXT_COMPACTION=rounds switches to round-based rebuilding (one
+  # evolving report every ROUNDS_K turns, see rounds.py) — a harness arm that a
+  # deployment selects per session through the environment, no profile edit.
+  context_compaction: ${AGENT_CONTEXT_COMPACTION:-tiered}
+  rounds_k: ${ROUNDS_K:-8}
+  rounds_keep_recent_turns: ${ROUNDS_KEEP_RECENT_TURNS:-2}
+  rounds_max_words: ${ROUNDS_MAX_WORDS:-1500}
+  # AGENT_CONTEXT_COMPACTION=bank keeps an evidence bank on disk (save_evidence)
+  # plus an outline instead of one report; see bank.py.
+  # AGENT_LOCAL_VERIFIER=1 audits every LOCAL_VERIFIER_K turns with a side call
+  # that may inject a short steer; see verify.py.
+  local_verifier: ${AGENT_LOCAL_VERIFIER:-false}
+  local_verifier_k: ${LOCAL_VERIFIER_K:-8}
   # Ephemeral recovery cache, isolated to the current session.
   compaction_spill: ${COMPACTION_SPILL:-true}
   max_len: ${OPENAI_CONTEXT_WINDOW:-262144}

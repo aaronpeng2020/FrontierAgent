@@ -20,6 +20,7 @@ EXPECTED_TOOLS = {
     "read_file",
     "recover_result",
     "run_python_code",
+    "save_evidence",
     "stop_subagent",
     "submit_report",
     "update_task",

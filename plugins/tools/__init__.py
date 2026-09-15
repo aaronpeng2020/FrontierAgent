@@ -21,6 +21,7 @@ from plugins.tools.grep_search import grep_search
 from plugins.tools.read_file import read_file
 from plugins.tools.recover_result import recover_result
 from plugins.tools.run_python_code import run_python_code
+from plugins.tools.save_evidence import save_evidence
 from plugins.tools.stop_subagent import stop_subagent
 from plugins.tools.submit_report import submit_report
 from plugins.tools.task_board import add_task, finish_planning, update_task
@@ -55,6 +56,7 @@ _BUILTIN_TOOLS: list[Tool] = [
     glob_search,
     run_python_code,
     recover_result,
+    save_evidence,
 ]
 
 

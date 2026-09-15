@@ -133,6 +133,23 @@ def _opener(ip: str) -> urllib.request.OpenerDirector:
     )
 
 
+# RFC 2544 benchmarking range. Never routed on the public internet, but it is
+# what fake-ip TUN proxies (mihomo / clash / sing-box) answer for EVERY name so
+# they can route by domain. On such a host every hostname fails the is_global
+# check above and web_fetch / download_file refuse everything. Opt-in only:
+# the address goes to the proxy's TUN, which maps it back to the domain, so it
+# cannot reach loopback or the LAN — unlike FRONTIER_AGENT_ALLOW_PRIVATE_FETCH,
+# which disables the vetting entirely.
+_FAKE_IP_RANGE = ipaddress.ip_network("198.18.0.0/15")
+_FAKE_IP_OK_ENV = "FRONTIER_AGENT_FAKE_IP_OK"
+
+
+def _is_allowed_fake_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if (os.environ.get(_FAKE_IP_OK_ENV) or "").strip() != "1":
+        return False
+    return ip.version == 4 and ip in _FAKE_IP_RANGE
+
+
 def _validate_public_url(url: str) -> tuple[str, ...]:
     """Vet *url* and return every public IP the request may be sent to.
 
@@ -164,7 +181,7 @@ def _validate_public_url(url: str) -> tuple[str, ...]:
     validated: list[tuple[int, str]] = []
     for address in addresses:
         ip = ipaddress.ip_address(address)
-        if not ip.is_global:
+        if not ip.is_global and not _is_allowed_fake_ip(ip):
             raise DownloadError(
                 f"refusing non-public address for {parsed.hostname}: {ip}",
             )

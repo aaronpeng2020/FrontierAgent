@@ -42,6 +42,13 @@ class LoopPolicy:
     no_tool_behavior: Literal["stop", "nudge"] = "nudge"
     no_tool_nudge_message: str = ""
     terminal_tool_names: tuple[str, ...] = ()
+    # Optional gate consulted before each nudge under ``no_tool_behavior="nudge"``:
+    # ``(visible_text, no_tool_retries) -> bool``. Returning False accepts the
+    # tool-less reply as the final answer (the run stops with ``no_tool``) instead
+    # of nudging. Lets a workflow nudge only replies that cannot be a finished
+    # answer (empty, a bare statement of intent, tasks still open) while a real
+    # answer ends the run at once, as it does under ``"stop"``.
+    no_tool_should_nudge: Callable[[str, int], bool] | None = None
 
 
 @dataclass

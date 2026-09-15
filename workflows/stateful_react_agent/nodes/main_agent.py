@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import os
 import time
 from pathlib import Path
@@ -80,7 +81,7 @@ from plugins.tools._sandbox import (
     resolve_sandbox_mode,
     set_task_sandbox,
 )
-from plugins.tools.task_board import build_task_board_observer, clear_board
+from plugins.tools.task_board import build_task_board_observer, clear_board, unresolved_count
 from workflows.stateful_react_agent._runtime import (
     ReactToolResultPostProcessor,
     _minimal_best_effort_answer,
@@ -536,8 +537,53 @@ def _log_inputs_dir_contents(
             )
 
 
-def _loop_policy() -> LoopPolicy:
-    return LoopPolicy(terminal_tool_names=(), no_tool_behavior="stop")
+# A tool-less reply is normally the final answer. Some models (deepseek-flash
+# behind a gateway, notably) also end turns on an EMPTY reply, or on a bare
+# statement of intent ("Let me nail this down.") without the tool call, and
+# under a plain ``stop`` policy that sentence became the delivered answer. The
+# gate below nudges only replies that cannot be a finished answer; a real
+# answer still ends the run immediately.
+_INTENT_TAIL = re.compile(
+    r"(\blet me\b|\blet's\b|\bi'll\b|\bi will\b|\bi am going to\b|\bi'm going to\b|"
+    r"\bnext,? i\b|\bnow i\b|\bnow let\b|\bfirst,? i\b|\bproceed(?:ing)? to\b|"
+    r"让我|我来|我将|我先|接下来|现在我|下一步)",
+    re.I,
+)
+_UNFINISHED_MAX_CHARS = 600
+
+_NO_TOOL_NUDGE = (
+    "Your last message ended without a tool call, but it does not look like a finished "
+    "answer (it is empty, announces a next step, or tasks on the board are still open). "
+    "Nothing you describe happens unless you actually emit the tool call. Either call the "
+    "tool you intended NOW, or — if the work is genuinely complete — mark the remaining "
+    "board tasks resolved/cancelled and write the COMPLETE final answer in this message. "
+    "The user only sees your last message, so it must stand on its own."
+)
+
+
+def _looks_unfinished(text: str, task_id: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    if len(stripped) > _UNFINISHED_MAX_CHARS or "```" in stripped:
+        # long, or carries a deliberate fenced block (a JSON deliverable, code)
+        return False
+    tail = stripped[-240:]
+    if _INTENT_TAIL.search(tail):
+        return True
+    try:
+        return unresolved_count(task_id) > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _loop_policy(task_id: str = "") -> LoopPolicy:
+    return LoopPolicy(
+        terminal_tool_names=(),
+        no_tool_behavior="nudge",
+        no_tool_nudge_message=_NO_TOOL_NUDGE,
+        no_tool_should_nudge=lambda text, _retries: _looks_unfinished(text, task_id),
+    )
 
 
 def _tools_for_stateful_react(
@@ -1090,7 +1136,8 @@ async def react_agent_node(state: dict[str, Any], ctx: NodeContext) -> dict[str,
                 context_token_limit=context_token_limit,
                 compact_after_turns=compact_after_turns,
                 keep_recent=keep_recent_msgs,
-                loop_policy=_loop_policy(),
+                loop_policy=_loop_policy(ctx.task_id),
+                no_tool_max_retries=3,
                 compactor=compactor,
                 compaction_policy=compaction_policy,
                 tool_result_post_processor=ReactToolResultPostProcessor(),

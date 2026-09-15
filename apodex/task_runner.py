@@ -471,6 +471,11 @@ class TaskRunnerMixin:
             "session_id": self.session_id,
             "turn_index": len(self.workflow_turns) + 1,
         }
+        # Deployment-specific research rules (Seekbase sets this); both native
+        # workflows splice ``_sys_prompt_addendum`` into their system prompt.
+        addendum = os.environ.get("APODEX_SYS_PROMPT_ADDENDUM", "").strip()
+        if addendum:
+            metadata["_sys_prompt_addendum"] = addendum
         self.r.note(
             f"workflow → {profile.workflow} · profile → {workflow_profile}"
         )

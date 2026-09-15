@@ -61,6 +61,14 @@ def board_size(task_id: str) -> int:
     return len(b["tasks"]) if b else 0
 
 
+def unresolved_count(task_id: str) -> int:
+    """Tasks still ``open`` / ``in_progress`` on this task's board (0 if no board)."""
+    b = _BOARDS.get(task_id)
+    if not b:
+        return 0
+    return sum(1 for t in b["tasks"].values() if t.get("resolution", "open") in ("open", "in_progress"))
+
+
 def build_task_board_observer(*, cooldown_turns: int = 5) -> TaskBoardObserver:
     """Bind the shared observer to this plugin's task-board state."""
     return TaskBoardObserver(

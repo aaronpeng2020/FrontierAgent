@@ -60,6 +60,7 @@ from frontier_agent.core.runtime.loop.llm_client import (
     extract_usage,
     is_truncated_with_text,
 )
+from frontier_agent.core.runtime.loop._response import _visible_response_text
 from frontier_agent.core.runtime.loop.model_profile import (
     DefaultThinkingParser,
     HistoryPolicy,
@@ -382,12 +383,23 @@ async def _run_loop_inner(
 
         if not parsed_calls:
             no_tool_retries += 1
-            if (
-                cfg.loop_policy.no_tool_behavior != "nudge"
-                or no_tool_retries >= cfg.no_tool_max_retries
-            ):
+            nudge = (
+                cfg.loop_policy.no_tool_behavior == "nudge"
+                and no_tool_retries < cfg.no_tool_max_retries
+            )
+            if nudge and cfg.loop_policy.no_tool_should_nudge is not None:
+                try:
+                    nudge = bool(cfg.loop_policy.no_tool_should_nudge(
+                        _visible_response_text(response), no_tool_retries,
+                    ))
+                except Exception:  # noqa: BLE001 — a broken gate must not break the loop
+                    logger.exception("turn=%d no_tool_should_nudge raised; accepting the reply", turn)
+                    nudge = False
+            if not nudge:
                 stop_reason = "no_tool"
                 break
+            logger.info("turn=%d tool-less reply judged unfinished — nudging (%d/%d)",
+                        turn, no_tool_retries, cfg.no_tool_max_retries - 1)
             messages.append(user_msg(_build_no_tool_nudge(cfg.loop_policy)))
             continue
 

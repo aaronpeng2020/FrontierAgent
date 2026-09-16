@@ -1,16 +1,19 @@
 """Web scraping tool with academic URL routing.
 
-Generic pages are read through twice (https://twice.sh): the service loads the
-URL in a real browser, passes anti-bot challenges where it legitimately can,
-converts PDFs, and hands back markdown. PMC / PubMed / bioRxiv / paywall URLs
-still go to the corresponding OA API first; twice is the leaf those routes
-fall back to.
+Generic pages are rendered locally first by moli (https://github.com/lexmount/moli,
+a lightweight headless browser: JavaScript apps render, anti-bot walls do not
+pass). Whatever moli cannot read is sent to twice (https://twice.sh): the
+service loads the URL in a real browser, passes anti-bot challenges where it
+legitimately can, converts PDFs, and hands back markdown. PMC / PubMed /
+bioRxiv / paywall URLs still go to the corresponding OA API first; the
+moli→twice pair is the leaf those routes fall back to.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
@@ -64,6 +67,22 @@ _GARBAGE_MAX_CHARS = 2_000
 # compressed. Tune upward if headroom allows.
 _SUMMARY_MIN_CHARS = 12_000
 
+# ── moli tunables ─────────────────────────────────────────────────────────
+# moli's own readiness deadline (page lifecycle + network idle), and the hard
+# cap on the subprocess after which it is killed. A page moli cannot finish in
+# this budget is exactly the kind twice's real browser exists for.
+_MOLI_TIMEOUT_MS = 15_000
+_MOLI_KILL_S = 25.0
+# Below this many chars the render is treated as an app shell / error page
+# and the URL goes on to twice. Matches ``_SHORT_CONTENT_THRESHOLD``.
+_MOLI_MIN_CHARS = 500
+# Peak RSS per render was 50-400 MB on real pages; the agent fans out
+# ``web_fetch`` over URL lists, so the local renders are capped.
+_MOLI_MAX_CONCURRENCY = 3
+_moli_slots: asyncio.Semaphore | None = None
+# Binary name → resolved path, or "" once a lookup failed.
+_moli_resolved: dict[str, str] = {}
+
 # ── twice tunables ────────────────────────────────────────────────────────
 _TWICE_FETCH_PATH = "/v1/fetch"
 # Server-side wait before ``POST /v1/fetch`` answers 202 with a run id
@@ -113,9 +132,10 @@ async def web_fetch(
 
     Automatic backend selection based on URL domain: PMC / PubMed / bioRxiv /
     medRxiv URLs go to the corresponding OA API; known paywall domains are
-    routed via Unpaywall; everything else is rendered by twice (a real
-    browser, so JavaScript apps, challenge pages and PDFs all read). Retry
-    and arXiv PDF→HTML redirect are applied automatically.
+    routed via Unpaywall; everything else is rendered by a headless browser
+    (moli locally, then twice — a real browser — for JavaScript apps behind
+    challenge pages and for PDFs). Retry and arXiv PDF→HTML redirect are
+    applied automatically.
 
     A non-empty ``info_to_extract`` routes a long page through a cheap
     extraction LLM that returns only the information requested. With it
@@ -305,11 +325,13 @@ async def _fetch_one(url: str, info_to_extract: str) -> str:
 async def _fetch_via_route(
     url: str, route: str, config: FrontierAgentConfig, *, question: str = "",
 ) -> tuple[str, str]:
-    """Dispatch to the domain-specific backend; always falls back to twice.
+    """Dispatch to the domain-specific backend; always falls back to a browser.
 
     Returns ``(content, answer)``. ``answer`` is twice's reply to
-    ``question`` and is only ever set on the generic route — the academic
-    backends return text from an OA API that answered no question.
+    ``question`` and is only ever set on the generic route when twice did
+    the render — the academic backends return text from an OA API that
+    answered no question, and moli answers none either (the summary LLM
+    covers a long moli page in ``_fetch_one``).
     """
     if route == "pmc":
         return await _fetch_pmc(url, config), ""
@@ -319,6 +341,9 @@ async def _fetch_via_route(
         return await _fetch_biorxiv(url, config), ""
     if route == "paywall":
         return await _fetch_paywall(url, config), ""
+    content = await _moli_text(url, config)
+    if content:
+        return content, ""
     return await _twice_text(url, config, question=question)
 
 
@@ -369,8 +394,87 @@ async def _fetch_paywall(url: str, config: FrontierAgentConfig) -> str:
 
 
 async def _twice_or_empty(url: str, config: FrontierAgentConfig) -> str:
-    """Read ``url`` through twice; empty string on any failure."""
+    """Render ``url`` (moli, then twice); empty string on any failure."""
+    content = await _moli_text(url, config)
+    if content:
+        return content
     content, _ = await _twice_text(url, config)
+    return content
+
+
+# ── moli (local render) ───────────────────────────────────────────────────
+
+def _moli_binary(config: FrontierAgentConfig) -> str:
+    """Absolute path of the moli binary, or "" when the pass is off/absent."""
+    name = getattr(config, "moli_bin", "") or ""
+    if not name:
+        return ""
+    if name not in _moli_resolved:
+        path = shutil.which(name)
+        if not path:
+            logger.info("moli binary %r not found; web_fetch goes straight to twice", name)
+        _moli_resolved[name] = path or ""
+    return _moli_resolved[name] or ""
+
+
+def _moli_usable(content: str) -> bool:
+    """Does a moli render look like page content rather than a wall/shell?"""
+    if len(content) < _MOLI_MIN_CHARS:
+        return False
+    return not (len(content) < _GARBAGE_MAX_CHARS and is_garbage_content(content))
+
+
+async def _moli_text(url: str, config: FrontierAgentConfig) -> str:
+    """Render ``url`` with the local moli browser; "" when twice should try.
+
+    Anything short of a clean, non-trivial markdown render — binary missing,
+    non-zero exit (PDFs, transport errors, HTTP errors), the deadline, an
+    access-denied / challenge page, an empty app shell — yields "" so the
+    caller falls through to twice. moli never raises into the route chains.
+    """
+    binary = _moli_binary(config)
+    if not binary:
+        return ""
+    global _moli_slots
+    if _moli_slots is None:
+        _moli_slots = asyncio.Semaphore(_MOLI_MAX_CONCURRENCY)
+    args = [
+        binary, "fetch", "--dump", "markdown",
+        "--timeout", str(_MOLI_TIMEOUT_MS), url,
+    ]
+    async with _moli_slots:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            record_api_request("moli", requests=0, errors=1)
+            logger.warning("moli could not start for %s: %s", url[:60], exc)
+            return ""
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), _MOLI_KILL_S)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            record_api_request("moli", requests=0, errors=1)
+            logger.info("moli killed after %.0fs for %s", _MOLI_KILL_S, url[:60])
+            return ""
+    if proc.returncode != 0:
+        record_api_request("moli", requests=0, errors=1)
+        logger.info(
+            "moli exit %s for %s: %s",
+            proc.returncode, url[:60], err.decode("utf-8", "replace").strip()[-200:],
+        )
+        return ""
+    content = out.decode("utf-8", "replace").strip()[:_TWICE_MAX_CHARS]
+    if not _moli_usable(content):
+        record_api_request("moli", errors=1)
+        logger.info("moli render of %s unusable (%d chars); trying twice", url[:60], len(content))
+        return ""
+    record_api_request("moli")
     return content
 
 

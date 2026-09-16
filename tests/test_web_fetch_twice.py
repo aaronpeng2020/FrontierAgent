@@ -57,7 +57,7 @@ def _isolate(monkeypatch: pytest.MonkeyPatch):
     scrape_result_cache.clear()
     monkeypatch.setattr(
         wf, "get_config",
-        lambda: SimpleNamespace(twice_api_key=_KEY, twice_base_url=_BASE),
+        lambda: SimpleNamespace(twice_api_key=_KEY, twice_base_url=_BASE, moli_bin=""),
     )
     # The SSRF vet resolves DNS; it has its own tests (test_network_tools) and
     # a sandbox resolver must not decide these. Everything below is public.
@@ -253,7 +253,8 @@ async def test_bad_api_key_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> No
 
 async def test_missing_key_names_the_variable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        wf, "get_config", lambda: SimpleNamespace(twice_api_key="", twice_base_url=_BASE),
+        wf, "get_config",
+        lambda: SimpleNamespace(twice_api_key="", twice_base_url=_BASE, moli_bin=""),
     )
 
     def no_transport(**kwargs: object) -> None:
@@ -312,6 +313,9 @@ async def test_live_twice_reads_its_own_landing_page(monkeypatch: pytest.MonkeyP
     config = get_config(force_reload=True)
     assert config.twice_api_key, "TWICE_API_KEY exported but not picked up by config"
     # Undo the fixture's fake endpoint: this one talks to the real service.
+    # moli stays off — the page must come from twice for the assertion to
+    # mean anything (see test_web_fetch_moli for the local render).
+    config = config.model_copy(update={"moli_bin": ""})
     monkeypatch.setattr(wf, "get_config", lambda: config)
 
     result = await _run("https://twice.sh/")

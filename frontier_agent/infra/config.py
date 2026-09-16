@@ -210,6 +210,10 @@ class FrontierAgentConfig(BaseSettings):
     # browser, challenge pages and PDFs included. TWICE_API_KEY / TWICE_BASE_URL.
     twice_api_key: str = ""
     twice_base_url: str = "https://twice.sh"
+    # First pass for generic pages: moli (https://github.com/lexmount/moli), a
+    # local headless browser, renders the page before twice is asked. A bare
+    # name is resolved on PATH; MOLI_BIN="" disables the pass.
+    moli_bin: str = "moli"
     # Suffix-matched domains blocked from both search and fetch.
     web_domain_blacklist_extra: str = ""
     # Domain-scoped, case-insensitive phrase filtering for search snippets.

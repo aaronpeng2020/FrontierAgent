@@ -87,8 +87,8 @@ services:
       OPENAI_MAX_TOKENS: ${SGLANG_MAX_OUTPUT_TOKENS:-4096}
       SERPER_API_KEY: ${SERPER_API_KEY:-}
       SERPER_BASE_URL: ${SERPER_BASE_URL:-https://google.serper.dev}
-      TWICE_API_KEY: ${TWICE_API_KEY:-}
-      TWICE_BASE_URL: ${TWICE_BASE_URL:-https://twice.sh}
+      SEARCHS_API_KEY: ${SEARCHS_API_KEY:-}
+      SEARCHS_BASE_URL: ${SEARCHS_BASE_URL:-https://api.searchs.io}
       JINA_API_KEY: ${JINA_API_KEY:-}
       JINA_BASE_URL: ${JINA_BASE_URL:-https://r.jina.ai}
 

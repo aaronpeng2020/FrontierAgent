@@ -206,10 +206,12 @@ class FrontierAgentConfig(BaseSettings):
     # ``web_fetch_aligned`` (react profile) still reads pages via Jina.
     jina_api_key: str = ""
     jina_base_url: str = "https://r.jina.ai"
-    # ``web_fetch`` reads pages through twice (https://twice.sh): a real
-    # browser, challenge pages and PDFs included. TWICE_API_KEY / TWICE_BASE_URL.
-    twice_api_key: str = ""
-    twice_base_url: str = "https://twice.sh"
+    # ``web_fetch`` reads pages through the searchs.io gateway's
+    # ``GET /v1/extract`` (plain fetch first, then twice.sh's real browser for
+    # challenge pages / JS apps / PDFs, then Jina). SEARCHS_API_KEY /
+    # SEARCHS_BASE_URL — the same sk_live_ key the search compat layers use.
+    searchs_api_key: str = ""
+    searchs_base_url: str = "https://api.searchs.io"
     # Suffix-matched domains blocked from both search and fetch.
     web_domain_blacklist_extra: str = ""
     # Domain-scoped, case-insensitive phrase filtering for search snippets.

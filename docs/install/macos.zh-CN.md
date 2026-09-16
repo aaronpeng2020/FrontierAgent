@@ -206,8 +206,8 @@ uv run frontier-agent --resume SESSION_ID
 ```dotenv
 SERPER_API_KEY=
 SERPER_BASE_URL=https://google.serper.dev
-TWICE_API_KEY=
-TWICE_BASE_URL=https://twice.sh
+SEARCHS_API_KEY=
+SEARCHS_BASE_URL=https://api.searchs.io
 JINA_API_KEY=
 JINA_BASE_URL=https://r.jina.ai
 ```

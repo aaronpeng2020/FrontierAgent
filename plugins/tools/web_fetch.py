@@ -1,10 +1,12 @@
 """Web scraping tool with academic URL routing.
 
-Generic pages are read through twice (https://twice.sh): the service loads the
-URL in a real browser, passes anti-bot challenges where it legitimately can,
-converts PDFs, and hands back markdown. PMC / PubMed / bioRxiv / paywall URLs
-still go to the corresponding OA API first; twice is the leaf those routes
-fall back to.
+Generic pages are read through the searchs.io gateway (``GET /v1/extract``,
+repo ~/code/searchs.io): a plain fetch first, then twice.sh — a real browser
+that passes anti-bot challenges where it legitimately can and converts PDFs —
+then Jina Reader, one markdown document either way. PMC / PubMed / bioRxiv /
+paywall URLs still go to the corresponding OA API first; the gateway is the
+leaf those routes fall back to. (The ``_twice_*`` names below predate the
+gateway hop; twice is still the engine that does the heavy lifting.)
 """
 
 from __future__ import annotations
@@ -14,7 +16,6 @@ import logging
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
 
 import httpx
 
@@ -35,7 +36,6 @@ from plugins.tools._academic_fetch import (
 from plugins.tools._bounded_fetch import (
     blocked_download_url,
     non_public_url_error,
-    read_bounded,
 )
 from plugins.tools._scrape_cache import ScrapeUnavailable, scrape_result_cache
 
@@ -64,22 +64,19 @@ _GARBAGE_MAX_CHARS = 2_000
 # compressed. Tune upward if headroom allows.
 _SUMMARY_MIN_CHARS = 12_000
 
-# ── twice tunables ────────────────────────────────────────────────────────
-_TWICE_FETCH_PATH = "/v1/fetch"
-# Server-side wait before ``POST /v1/fetch`` answers 202 with a run id
-# instead of the page (service default 90, max 120).
+# ── searchs.io extract tunables ───────────────────────────────────────────
+_EXTRACT_PATH = "/v1/extract"
+_SEARCHS_DEFAULT_BASE = "https://api.searchs.io"
+# How long the gateway may keep twice on a page before answering 502/504
+# (gateway cap 120). A challenge page or PDF takes 10-40 s; a cold runner
+# adds 1-2 min, which then surfaces as a failed fetch the agent retries later.
 _TWICE_WAIT_S = 90
-# First slice of page text requested. Overflow trimming / spill handles
-# anything the agent cannot carry; the service caps a slice at 500k.
+# Page text requested. Overflow trimming / spill handles anything the agent
+# cannot carry; the gateway caps a document at 200k.
 _TWICE_MAX_CHARS = 200_000
-# Long-poll length per ``GET /v1/runs/<id>/wait`` call.
-_TWICE_POLL_S = 60
-# Hard ceiling on one fetch, polling included: a challenge page or PDF takes
-# 10-40 s, a cold runner adds 1-2 min.
-_TWICE_DEADLINE_S = 360
-# ``question`` is answered by a small model; keep the prompt bounded.
+# ``question`` is answered by a small model while twice has the page open;
+# the gateway forwards up to 2000 chars.
 _TWICE_MAX_QUESTION_CHARS = 2_000
-_TWICE_RUNNING_STATES = frozenset({"queued", "pending", "claimed", "running"})
 
 # URLs twice reported as ``challenge: blocked`` during the current
 # ``_fetch_one`` call. The academic routes try several URLs and only return
@@ -91,7 +88,7 @@ _blocked_urls: ContextVar[list[str] | None] = ContextVar(
 
 @dataclass(frozen=True)
 class _TwicePage:
-    """One page as twice returned it."""
+    """One page as the gateway (twice underneath) returned it."""
 
     content: str
     title: str = ""
@@ -113,9 +110,10 @@ async def web_fetch(
 
     Automatic backend selection based on URL domain: PMC / PubMed / bioRxiv /
     medRxiv URLs go to the corresponding OA API; known paywall domains are
-    routed via Unpaywall; everything else is rendered by twice (a real
-    browser, so JavaScript apps, challenge pages and PDFs all read). Retry
-    and arXiv PDF→HTML redirect are applied automatically.
+    routed via Unpaywall; everything else goes through the searchs.io
+    gateway (plain fetch, then twice — a real browser — for JavaScript apps,
+    challenge pages and PDFs). Retry and arXiv PDF→HTML redirect are applied
+    automatically.
 
     A non-empty ``info_to_extract`` routes a long page through a cheap
     extraction LLM that returns only the information requested. With it
@@ -272,11 +270,11 @@ async def _fetch_one(url: str, info_to_extract: str) -> str:
                 f"anti-bot protection. Please try searching for an open-access "
                 f"version (arxiv.org, PMC, institutional repositories)."
             )
-        if not config.twice_api_key:
+        if not config.searchs_api_key:
             return (
-                f"Could not extract content from {url}: TWICE_API_KEY is not "
+                f"Could not extract content from {url}: SEARCHS_API_KEY is not "
                 "set, so web_fetch cannot read web pages. Configure it "
-                "(https://twice.sh) or answer from other sources."
+                "(https://searchs.io) or answer from other sources."
             )
         return f"Could not extract content from {url}"
     finally:
@@ -383,7 +381,7 @@ async def _twice_text(
     per-fetch context so the caller can say so instead of "could not
     extract"; it never raises into the academic fallback chains.
     """
-    if not config.twice_api_key:
+    if not config.searchs_api_key:
         return "", ""
     try:
         page = await _twice_fetch(url, config, question=question)
@@ -440,12 +438,16 @@ async def _maybe_recover_via_unpaywall(
     return content
 
 
-# ── twice client ──────────────────────────────────────────────────────────
+# ── searchs.io extract client ─────────────────────────────────────────────
+# ``GET /v1/extract?engine=auto`` on the gateway: a plain fetch first (free,
+# sub-second), twice.sh's real browser when the page is bot-walled / JS-only
+# / too thin / a PDF, then Jina Reader — one JSON document either way, so
+# there is no 202 / run polling on this side any more. ``question`` forces
+# twice (the only engine that answers it) and comes back as ``answer``.
 
 def _twice_headers(config: FrontierAgentConfig) -> dict[str, str]:
     return {
-        "Authorization": f"Bearer {config.twice_api_key}",
-        "Content-Type": "application/json",
+        "Authorization": f"Bearer {config.searchs_api_key}",
         "Accept": "application/json",
     }
 
@@ -453,224 +455,128 @@ def _twice_headers(config: FrontierAgentConfig) -> dict[str, str]:
 async def _twice_fetch(
     url: str, config: FrontierAgentConfig, *, question: str = "",
 ) -> _TwicePage | None:
-    """One page through ``POST /v1/fetch``; ``None`` when it could not be read.
+    """One page through the gateway; ``None`` when it could not be read.
 
-    A 202 (challenge page / PDF still rendering after ``wait``) is followed
-    through ``GET /v1/runs/<id>/wait`` until the run is terminal, then the
-    text is downloaded from ``verdict.page.content_url``. 429/5xx/transport
-    errors retry with backoff; anything else from the service (bad key, plan
-    limit) is a configuration problem and aborts without retry.
+    429 / 5xx / transport errors retry with backoff, except the gateway's own
+    ``fetch_failed`` (every engine already gave up on the page — a retry
+    would only re-run the whole chain). Anything else from the service (bad
+    key, plan limit) is a configuration problem and aborts without retry.
     """
-    base = (config.twice_base_url or "https://twice.sh").rstrip("/")
+    base = (config.searchs_base_url or _SEARCHS_DEFAULT_BASE).rstrip("/")
     headers = _twice_headers(config)
-    body: dict[str, Any] = {
+    params: dict[str, Any] = {
         "url": url,
-        "format": "markdown",
+        "engine": "auto",
         "wait": _TWICE_WAIT_S,
         "max_chars": _TWICE_MAX_CHARS,
     }
     if question:
-        body["question"] = question[:_TWICE_MAX_QUESTION_CHARS]
+        params["question"] = question[:_TWICE_MAX_QUESTION_CHARS]
 
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + _TWICE_DEADLINE_S
-    timeout = httpx.Timeout(_TWICE_WAIT_S + 30, connect=20)
+    # The gateway aborts twice at wait+15 s; leave room for its own hop.
+    timeout = httpx.Timeout(_TWICE_WAIT_S + 45, connect=20)
     async with httpx.AsyncClient(timeout=timeout) as client:
-        data = await _twice_post(client, base, headers, body, url)
-        if data is None:
-            return None
-        if data.get("status") in _TWICE_RUNNING_STATES:
-            run_id = str(data.get("run_id") or "")
-            if not run_id:
-                logger.error("twice answered 202 without a run_id for %s", url[:60])
-                return None
-            data = await _twice_wait(client, base, headers, run_id, url, deadline)
-            if data is None:
-                return None
+        data = await _twice_get(client, base, headers, params, url)
+    if data is None:
+        return None
     return _twice_page_from(data, url)
 
 
-async def _twice_post(
+def _gateway_error(resp: httpx.Response) -> tuple[str, str]:
+    """``(error code, message)`` from a gateway error envelope; "" when absent."""
+    try:
+        data = resp.json()
+    except ValueError:
+        return "", ""
+    if not isinstance(data, dict):
+        return "", ""
+    return str(data.get("error") or ""), str(data.get("message") or "")
+
+
+async def _twice_get(
     client: httpx.AsyncClient,
     base: str,
     headers: dict[str, str],
-    body: dict[str, Any],
+    params: dict[str, Any],
     url: str,
 ) -> dict[str, Any] | None:
     for attempt in range(_MAX_RETRIES):
         try:
-            resp = await client.post(
-                f"{base}{_TWICE_FETCH_PATH}", headers=headers, json=body,
-            )
+            resp = await client.get(f"{base}{_EXTRACT_PATH}", headers=headers, params=params)
         except httpx.TimeoutException:
-            record_api_request("twice", requests=0, errors=1)
+            record_api_request("searchs", requests=0, errors=1)
             logger.warning(
-                "twice timeout for %s (attempt %d)", url[:60], attempt + 1,
+                "searchs.io extract timeout for %s (attempt %d)", url[:60], attempt + 1,
             )
             resp = None
         except httpx.HTTPError as exc:
-            record_api_request("twice", requests=0, errors=1)
+            record_api_request("searchs", requests=0, errors=1)
             logger.warning(
-                "twice transport error for %s: %s (attempt %d)",
+                "searchs.io extract transport error for %s: %s (attempt %d)",
                 url[:60], exc, attempt + 1,
             )
             resp = None
 
         if resp is not None:
-            if resp.status_code in (200, 202):
-                record_api_request("twice")
+            if resp.status_code == 200:
+                record_api_request("searchs")
                 try:
                     data = resp.json()
                 except ValueError:
-                    logger.error("twice returned non-JSON for %s", url[:60])
+                    logger.error("searchs.io extract returned non-JSON for %s", url[:60])
                     return None
                 return data if isinstance(data, dict) else None
-            record_api_request("twice", errors=1)
+            record_api_request("searchs", errors=1)
+            code, message = _gateway_error(resp)
+            if code == "fetch_failed":
+                # Every engine (fetch → twice → jina) gave up on this page.
+                logger.warning(
+                    "searchs.io could not read %s: %s", url[:60], message[:200],
+                )
+                return None
             if resp.status_code != 429 and resp.status_code < 500:
                 # Bad key, plan limit, malformed request: retrying cannot help.
                 logger.error(
-                    "twice HTTP %d for %s (body: %s)",
+                    "searchs.io extract HTTP %d for %s (body: %s)",
                     resp.status_code, url[:60], resp.text[:200],
                 )
                 return None
             logger.warning(
-                "twice HTTP %d for %s (attempt %d)",
+                "searchs.io extract HTTP %d for %s (attempt %d)",
                 resp.status_code, url[:60], attempt + 1,
             )
 
         if attempt < _MAX_RETRIES - 1:
             await asyncio.sleep(2 ** attempt)
-    logger.error("twice fetch exhausted retries for %s", url[:60])
+    logger.error("searchs.io extract exhausted retries for %s", url[:60])
     return None
 
 
-async def _twice_wait(
-    client: httpx.AsyncClient,
-    base: str,
-    headers: dict[str, str],
-    run_id: str,
-    url: str,
-    deadline: float,
-) -> dict[str, Any] | None:
-    """Long-poll a 202 run to a terminal state; return a ``/v1/fetch``-shaped dict."""
-    loop = asyncio.get_running_loop()
-    transport_failures = 0
-    while True:
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            logger.warning(
-                "twice run %s for %s still running after %ds — giving up",
-                run_id, url[:60], _TWICE_DEADLINE_S,
-            )
-            return None
-        poll = int(max(1, min(_TWICE_POLL_S, remaining)))
-        try:
-            resp = await client.get(
-                f"{base}/v1/runs/{run_id}/wait",
-                params={"timeout": poll},
-                headers=headers,
-                timeout=httpx.Timeout(poll + 30, connect=20),
-            )
-        except httpx.HTTPError as exc:
-            transport_failures += 1
-            record_api_request("twice", requests=0, errors=1)
-            logger.warning("twice poll error for %s: %s", url[:60], exc)
-            if transport_failures >= _MAX_RETRIES:
-                return None
-            await asyncio.sleep(2 ** transport_failures)
-            continue
-        if resp.status_code != 200:
-            record_api_request("twice", errors=1)
-            logger.error(
-                "twice poll HTTP %d for run %s (%s)", resp.status_code, run_id, url[:60],
-            )
-            return None
-        try:
-            data = resp.json()
-        except ValueError:
-            logger.error("twice poll returned non-JSON for run %s", run_id)
-            return None
-        if not isinstance(data, dict):
-            return None
-        status = str(data.get("status") or "")
-        if status in _TWICE_RUNNING_STATES:
-            continue
-        if status != "completed" or data.get("error"):
-            logger.warning(
-                "twice run %s for %s ended %s: %s",
-                run_id, url[:60], status or "unknown", data.get("error"),
-            )
-            return None
-        verdict = data.get("verdict") or {}
-        page = verdict.get("page") if isinstance(verdict, dict) else None
-        if not isinstance(page, dict):
-            page = {}
-        content = ""
-        content_url = page.get("content_url")
-        if isinstance(content_url, str) and content_url:
-            content = await _twice_download(client, base, headers, content_url, url)
-        return {"status": "completed", "page": page, "content": content}
-
-
-async def _twice_download(
-    client: httpx.AsyncClient,
-    base: str,
-    headers: dict[str, str],
-    content_url: str,
-    url: str,
-) -> str:
-    """Fetch the finished run's text. Only the service's own origin gets our key."""
-    if urlsplit(content_url)[:2] != urlsplit(base)[:2]:
-        logger.error(
-            "twice content_url %s is not on %s — refusing to send credentials",
-            content_url[:80], base,
-        )
-        return ""
-    try:
-        async with client.stream(
-            "GET", content_url, headers={"Authorization": headers["Authorization"]},
-        ) as resp:
-            if resp.status_code != 200:
-                record_api_request("twice", errors=1)
-                logger.error(
-                    "twice content download HTTP %d for %s", resp.status_code, url[:60],
-                )
-                return ""
-            body, _ = await read_bounded(resp)
-    except httpx.HTTPError as exc:
-        record_api_request("twice", requests=0, errors=1)
-        logger.warning("twice content download failed for %s: %s", url[:60], exc)
-        return ""
-    # The service writes UTF-8 markdown; skip charset sniffing (chardet
-    # mis-classifies CJK-heavy bodies with ASCII headers as Windows-1252).
-    return body.decode("utf-8", errors="replace")
-
-
 def _twice_page_from(data: dict[str, Any], url: str) -> _TwicePage | None:
-    page = data.get("page")
-    if not isinstance(page, dict):
-        page = {}
-    content = data.get("content")
+    """Shape the gateway's ExtractResult into a ``_TwicePage``."""
+    content = data.get("markdown")
+    if not isinstance(content, str) or not content:
+        content = data.get("content")
     if not isinstance(content, str):
         content = ""
     try:
-        status = int(page.get("status") or 0)
+        status = int(data.get("status") or 0)
     except (TypeError, ValueError):
         status = 0
-    challenge = str(page.get("challenge") or "none")
-    title = str(page.get("title") or "")
-    answer = page.get("answer")
+    challenge = str(data.get("challenge") or "none")
+    title = str(data.get("title") or "")
+    answer = data.get("answer")
     answer = answer.strip() if isinstance(answer, str) else ""
 
     if challenge == "blocked":
         logger.warning(
-            "twice: %s blocks automated access (HTTP %d, challenge blocked)",
+            "searchs.io/twice: %s blocks automated access (HTTP %d, challenge blocked)",
             url[:60], status,
         )
         return _TwicePage(content="", title=title, status=status, challenge=challenge)
     if status >= 400:
         # The origin answered with an error page; its body is not the page.
-        logger.warning("twice: HTTP %d from origin for %s", status, url[:60])
+        logger.warning("searchs.io: HTTP %d from origin for %s", status, url[:60])
         return None
     return _TwicePage(
         content=content, title=title, answer=answer, status=status, challenge=challenge,

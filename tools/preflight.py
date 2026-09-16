@@ -39,7 +39,7 @@ def report_env() -> None:
     for name, val in (
         ("openai_api_key", c.openai_api_key),
         ("serper_api_key", c.serper_api_key),
-        ("twice_api_key", c.twice_api_key),
+        ("searchs_api_key", c.searchs_api_key),
         ("jina_api_key", c.jina_api_key),
         # judges read these straight from the environment, not through config
         ("JUDGE_API_KEY", os.environ.get("JUDGE_API_KEY")),
